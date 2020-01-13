@@ -2033,6 +2033,7 @@ void deinit(void)
 		free(p->check_req);
 		free(p->cookie_name);
 		free(p->cookie_domain);
+		free(p->cookie_samesite);
 		free(p->url_param_name);
 		free(p->capture_name);
 		free(p->monitor_uri);

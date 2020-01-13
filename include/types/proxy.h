@@ -290,6 +290,7 @@ struct proxy {
 	char *dyncookie_key;			/* Secret key used to generate dynamic persistent cookies */
 	unsigned int cookie_maxidle;		/* max idle time for this cookie */
 	unsigned int cookie_maxlife;		/* max life time for this cookie */
+	char * cookie_samesite;		/* setting for the SameSite attribute of the cookie  */
 	char *rdp_cookie_name;			/* name of the RDP cookie to look for */
 	int  rdp_cookie_len;			/* strlen(rdp_cookie_name), computed only once */
 	char *url_param_name;			/* name of the URL parameter used for hashing */

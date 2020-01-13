@@ -3380,6 +3380,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		free(curproxy->cookie_name);
 		curproxy->cookie_name = strdup(args[1]);
 		curproxy->cookie_len = strlen(curproxy->cookie_name);
+		free(curproxy->cookie_samesite); curproxy->cookie_samesite = NULL;
 
 		cur_arg = 2;
 		while (*(args[cur_arg])) {
@@ -3498,6 +3499,34 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[cur_arg], NULL))
 					err_code |= ERR_WARN;
 				curproxy->ck_opts |= PR_CK_DYNAMIC;
+			}
+			else if (!strcmp(args[cur_arg], "samesite")) {
+				const char *ss;
+
+				if (!*args[cur_arg + 1]) {
+					ha_alert("parsing [%s:%d]: '%s' expects <samesite-value> as argument.\n",
+						 file, linenum, args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
+				ss = args[cur_arg + 1];
+
+				if (!strcmp(ss, "none")) {
+					curproxy->cookie_samesite = "None";
+					curproxy->ck_opts |= PR_CK_SECURE;
+				} else if (!strcmp(ss, "lax")) {
+					curproxy->cookie_samesite = "Lax";
+				} else if (!strcmp(ss, "strict")) {
+					curproxy->cookie_samesite = "Strict";
+				} else {
+					ha_alert("parsing [%s:%d]: '%s' supports 'none', 'lax' and 'strict' as argument.\n",
+						 file, linenum, ss);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				
+				cur_arg++;
 			}
 
 			else {
