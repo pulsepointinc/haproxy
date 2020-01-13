@@ -416,7 +416,7 @@ static int cli_parse_request(struct appctx *appctx, char *line)
 
 	/* unescape '\' */
 	arg = 0;
-	while (*args[arg] != '\0') {
+	while (arg <= MAX_STATS_ARGS && *args[arg] != '\0') {
 		j = 0;
 		for (i=0; args[arg][i] != '\0'; i++) {
 			if (args[arg][i] == '\\') {
@@ -441,10 +441,19 @@ static int cli_parse_request(struct appctx *appctx, char *line)
 
 	appctx->io_handler = kw->io_handler;
 	appctx->io_release = kw->io_release;
-	/* kw->parse could set its own io_handler or ip_release handler */
-	if ((!kw->parse || kw->parse(args, appctx, kw->private) == 0) && appctx->io_handler) {
-		appctx->st0 = CLI_ST_CALLBACK;
-	}
+
+	if (kw->parse && kw->parse(args, appctx, kw->private) != 0)
+		goto fail;
+
+	/* kw->parse could set its own io_handler or io_release handler */
+	if (!appctx->io_handler)
+		goto fail;
+
+	appctx->st0 = CLI_ST_CALLBACK;
+	return 1;
+fail:
+	appctx->io_handler = NULL;
+	appctx->io_release = NULL;
 	return 1;
 }
 
@@ -625,14 +634,20 @@ static void cli_io_handler(struct appctx *appctx)
 				else
 					si_applet_cant_put(si);
 				break;
-			case CLI_ST_PRINT_FREE:
-				if (cli_output_msg(res, appctx->ctx.cli.err, LOG_ERR, cli_get_severity_output(appctx)) != -1) {
+			case CLI_ST_PRINT_FREE: {
+				const char *msg = appctx->ctx.cli.err;
+
+				if (!msg)
+					msg = "Out of memory.\n";
+
+				if (cli_output_msg(res, msg, LOG_ERR, cli_get_severity_output(appctx)) != -1) {
 					free(appctx->ctx.cli.err);
 					appctx->st0 = CLI_ST_PROMPT;
 				}
 				else
 					si_applet_cant_put(si);
 				break;
+			}
 			case CLI_ST_CALLBACK: /* use custom pointer */
 				if (appctx->io_handler)
 					if (appctx->io_handler(appctx)) {
@@ -772,20 +787,28 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 	/* we have two inner loops here, one for the proxy, the other one for
 	 * the buffer.
 	 */
-	while (fd < maxfd) {
+	while (fd >= 0 && fd < global.maxsock) {
 		struct fdtab fdt;
 		struct listener *li = NULL;
 		struct server *sv = NULL;
 		struct proxy *px = NULL;
+		const struct mux_ops *mux = NULL;
+		void *ctx = NULL;
 		uint32_t conn_flags = 0;
+
+		thread_isolate();
 
 		fdt = fdtab[fd];
 
-		if (!fdt.owner)
+		if (!fdt.owner) {
+			thread_release();
 			goto skip; // closed
+		}
 
 		if (fdt.iocb == conn_fd_handler) {
 			conn_flags = ((struct connection *)fdt.owner)->flags;
+			mux = ((struct connection *)fdt.owner)->mux;
+			ctx = ((struct connection *)fdt.owner)->mux_ctx;
 			li = objt_listener(((struct connection *)fdt.owner)->target);
 			sv = objt_server(((struct connection *)fdt.owner)->target);
 			px = objt_proxy(((struct connection *)fdt.owner)->target);
@@ -794,7 +817,7 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			li = fdt.owner;
 
 		chunk_printf(&trash,
-			     "  %5d : st=0x%02x(R:%c%c%c W:%c%c%c) ev=0x%02x(%c%c%c%c%c) [%c%c%c%c] cache=%u owner=%p iocb=%p(%s) tmask=0x%lx",
+			     "  %5d : st=0x%02x(R:%c%c%c W:%c%c%c) ev=0x%02x(%c%c%c%c%c) [%c%c%c] cache=%u owner=%p iocb=%p(%s) tmask=0x%lx umask=0x%lx",
 			     fd,
 			     fdt.state,
 			     (fdt.state & FD_EV_POLLED_R) ? 'P' : 'p',
@@ -810,7 +833,6 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			     (fdt.ev & FD_POLL_PRI) ? 'P' : 'p',
 			     (fdt.ev & FD_POLL_IN)  ? 'I' : 'i',
 			     fdt.new ? 'N' : 'n',
-			     fdt.updated ? 'U' : 'u',
 			     fdt.linger_risk ? 'L' : 'l',
 			     fdt.cloned ? 'C' : 'c',
 			     fdt.cache,
@@ -819,8 +841,9 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			     (fdt.iocb == conn_fd_handler)  ? "conn_fd_handler" :
 			     (fdt.iocb == dgram_fd_handler) ? "dgram_fd_handler" :
 			     (fdt.iocb == listener_accept)  ? "listener_accept" :
+			     (fdt.iocb == thread_sync_io_handler) ? "thread_sync_io_handler" :
 			     "unknown",
-			     fdt.thread_mask);
+			     fdt.thread_mask, fdt.update_mask);
 
 		if (fdt.iocb == conn_fd_handler) {
 			chunk_appendf(&trash, " cflg=0x%08x", conn_flags);
@@ -830,12 +853,22 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 				chunk_appendf(&trash, " sv=%s/%s", sv->id, sv->proxy->id);
 			else if (li)
 				chunk_appendf(&trash, " fe=%s", li->bind_conf->frontend->id);
+
+			if (mux) {
+				chunk_appendf(&trash, " mux=%s mux_ctx=%p", mux->name, ctx);
+				if (mux->show_fd)
+					mux->show_fd(&trash, fdt.owner);
+			}
+			else
+				chunk_appendf(&trash, " nomux");
 		}
 		else if (fdt.iocb == listener_accept) {
 			chunk_appendf(&trash, " l.st=%s fe=%s",
 			              listener_state_str(li),
 			              li->bind_conf->frontend->id);
 		}
+
+		thread_release();
 
 		chunk_appendf(&trash, "\n");
 
@@ -849,6 +882,53 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 
 		fd++;
 		appctx->ctx.cli.i0 = fd;
+	}
+
+	/* dump complete */
+	return 1;
+}
+
+/* This function dumps some activity counters used by developers and support to
+ * rule out some hypothesis during bug reports. It returns 0 if the output
+ * buffer is full and it needs to be called again, otherwise non-zero. It dumps
+ * everything at once in the buffer and is not designed to do it in multiple
+ * passes.
+ */
+static int cli_io_handler_show_activity(struct appctx *appctx)
+{
+	struct stream_interface *si = appctx->owner;
+	int thr;
+
+	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW)))
+		return 1;
+
+	chunk_reset(&trash);
+
+	chunk_appendf(&trash, "thread_id: %u", tid);
+	chunk_appendf(&trash, "\ndate_now: %lu.%06lu", (long)now.tv_sec, (long)now.tv_usec);
+	chunk_appendf(&trash, "\nloops:");        for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].loops);
+	chunk_appendf(&trash, "\nwake_cache:");   for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_cache);
+	chunk_appendf(&trash, "\nwake_tasks:");   for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_tasks);
+	chunk_appendf(&trash, "\nwake_applets:"); for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_applets);
+	chunk_appendf(&trash, "\nwake_signal:");  for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_signal);
+	chunk_appendf(&trash, "\npoll_exp:");     for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_exp);
+	chunk_appendf(&trash, "\npoll_drop:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_drop);
+	chunk_appendf(&trash, "\npoll_dead:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_dead);
+	chunk_appendf(&trash, "\npoll_skip:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].poll_skip);
+	chunk_appendf(&trash, "\nfd_skip:");      for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].fd_skip);
+	chunk_appendf(&trash, "\nfd_lock:");      for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].fd_lock);
+	chunk_appendf(&trash, "\nfd_del:");       for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].fd_del);
+	chunk_appendf(&trash, "\nconn_dead:");    for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].conn_dead);
+	chunk_appendf(&trash, "\nstream:");       for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].stream);
+	chunk_appendf(&trash, "\nempty_rq:");     for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].empty_rq);
+	chunk_appendf(&trash, "\nlong_rq:");      for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].long_rq);
+
+	chunk_appendf(&trash, "\n");
+
+	if (ci_putchk(si_ic(si), &trash) == -1) {
+		chunk_reset(&trash);
+		chunk_printf(&trash, "[output too large, cannot dump]\n");
+		si_applet_cant_put(si);
 	}
 
 	/* dump complete */
@@ -901,15 +981,19 @@ static int cli_io_handler_show_cli_sock(struct appctx *appctx)
 							const struct sockaddr_un *un;
 
 							un = (struct sockaddr_un *)&l->addr;
-							chunk_appendf(&trash, "%s ", un->sun_path);
+							if (un->sun_path[0] == '\0') {
+								chunk_appendf(&trash, "abns@%s ", un->sun_path+1);
+							} else {
+								chunk_appendf(&trash, "unix@%s ", un->sun_path);
+							}
 						} else if (l->addr.ss_family == AF_INET) {
 							addr_to_str(&l->addr, addr, sizeof(addr));
 							port_to_str(&l->addr, port, sizeof(port));
-							chunk_appendf(&trash, "%s:%s ", addr, port);
+							chunk_appendf(&trash, "ipv4@%s:%s ", addr, port);
 						} else if (l->addr.ss_family == AF_INET6) {
 							addr_to_str(&l->addr, addr, sizeof(addr));
 							port_to_str(&l->addr, port, sizeof(port));
-							chunk_appendf(&trash, "[%s]:%s ", addr, port);
+							chunk_appendf(&trash, "ipv6@[%s]:%s ", addr, port);
 						} else
 							continue;
 
@@ -1139,7 +1223,7 @@ static int cli_parse_set_ratelimit(char **args, struct appctx *appctx, void *pri
 			"   - 'connections global' to set the per-process maximum connection rate\n"
 			"   - 'sessions global' to set the per-process maximum session rate\n"
 #ifdef USE_OPENSSL
-			"   - 'ssl-session global' to set the per-process maximum SSL session rate\n"
+			"   - 'ssl-sessions global' to set the per-process maximum SSL session rate\n"
 #endif
 			"   - 'http-compression global' to set the per-process maximum compression speed in kB/s\n";
 		appctx->st0 = CLI_ST_PRINT;
@@ -1246,10 +1330,17 @@ static int _getsocks(char **args, struct appctx *appctx, void *private)
 	int tot_fd_nb = 0;
 	struct proxy *px;
 	int i = 0;
-	int fd = remote->handle.fd;
+	int fd = -1;
 	int curoff = 0;
-	int old_fcntl;
+	int old_fcntl = -1;
 	int ret;
+
+	if (!remote) {
+		ha_warning("Only works on real connections\n");
+		goto out;
+	}
+
+	fd = remote->handle.fd;
 
 	/* Temporary set the FD in blocking mode, that will make our life easier */
 	old_fcntl = fcntl(fd, F_GETFL);
@@ -1371,7 +1462,6 @@ static int _getsocks(char **args, struct appctx *appctx, void *private)
 				iov.iov_len = curoff;
 				if (sendmsg(fd, &msghdr, 0) != curoff) {
 					ha_warning("Failed to transfer sockets\n");
-					printf("errno %d\n", errno);
 					goto out;
 				}
 				/* Wait for an ack */
@@ -1400,7 +1490,7 @@ static int _getsocks(char **args, struct appctx *appctx, void *private)
 	}
 
 out:
-	if (old_fcntl >= 0 && fcntl(fd, F_SETFL, old_fcntl) == -1) {
+	if (fd >= 0 && old_fcntl >= 0 && fcntl(fd, F_SETFL, old_fcntl) == -1) {
 		ha_warning("Cannot make the unix socket non-blocking\n");
 		goto out;
 	}
@@ -1428,6 +1518,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "show", "env",  NULL }, "show env [var] : dump environment variables known to the process", cli_parse_show_env, cli_io_handler_show_env, NULL },
 	{ { "show", "cli", "sockets",  NULL }, "show cli sockets : dump list of cli sockets", cli_parse_default, cli_io_handler_show_cli_sock, NULL },
 	{ { "show", "fd", NULL }, "show fd [num] : dump list of file descriptors in use", cli_parse_show_fd, cli_io_handler_show_fd, NULL },
+	{ { "show", "activity", NULL }, "show activity : show per-thread activity stats (for support/developers)", cli_parse_default, cli_io_handler_show_activity, NULL },
 	{ { "_getsocks", NULL }, NULL,  _getsocks, NULL },
 	{{},}
 }};

@@ -400,6 +400,7 @@ int conn_si_send_proxy(struct connection *conn, unsigned int flag)
 	if (conn->flags & CO_FL_WAIT_L4_CONN)
 		conn->flags &= ~CO_FL_WAIT_L4_CONN;
 	conn->flags &= ~flag;
+	__conn_sock_stop_send(conn);
 	return 1;
 
  out_error:
@@ -409,6 +410,7 @@ int conn_si_send_proxy(struct connection *conn, unsigned int flag)
 
  out_wait:
 	__conn_sock_stop_recv(conn);
+	__conn_sock_want_send(conn);
 	return 0;
 }
 
@@ -455,6 +457,7 @@ void stream_int_notify(struct stream_interface *si)
 {
 	struct channel *ic = si_ic(si);
 	struct channel *oc = si_oc(si);
+	struct task *task = si_task(si);
 
 	/* process consumer side */
 	if (channel_is_empty(oc)) {
@@ -553,7 +556,24 @@ void stream_int_notify(struct stream_interface *si)
 	      ((oc->flags & CF_WAKE_WRITE) &&
 	       (si_opposite(si)->state != SI_ST_EST ||
 	        (channel_is_empty(oc) && !oc->to_forward)))))) {
-		task_wakeup(si_task(si), TASK_WOKEN_IO);
+		task_wakeup(task, TASK_WOKEN_IO);
+	}
+	else {
+		/* Update expiration date for the task and requeue it */
+		task->expire = tick_first((tick_is_expired(task->expire, now_ms) ? 0 : task->expire),
+					  tick_first(tick_first(ic->rex, ic->wex),
+						     tick_first(oc->rex, oc->wex)));
+
+		task->expire = tick_first(task->expire, ic->analyse_exp);
+		task->expire = tick_first(task->expire, oc->analyse_exp);
+
+		if (si->exp)
+			task->expire = tick_first(task->expire, si->exp);
+
+		if (si_opposite(si)->exp)
+			task->expire = tick_first(task->expire, si_opposite(si)->exp);
+
+		task_queue(task);
 	}
 	if (ic->flags & CF_READ_ACTIVITY)
 		ic->flags &= ~CF_READ_DONTWAIT;
@@ -720,7 +740,7 @@ void stream_int_update(struct stream_interface *si)
 				ic->rex = TICK_ETERNITY;
 			}
 		}
-		else {
+		else if (!(si->flags & SI_FL_WAIT_ROOM) || !ic->buf->o) {
 			/* (re)start reading and update timeout. Note: we don't recompute the timeout
 			 * everytime we get here, otherwise it would risk never to expire. We only
 			 * update it if is was not yet set. The stream socket handler will already
@@ -822,6 +842,9 @@ static void stream_int_shutr_conn(struct stream_interface *si)
 	if (si->state != SI_ST_EST && si->state != SI_ST_CON)
 		return;
 
+	if (si->flags & SI_FL_KILL_CONN)
+		cs->flags |= CS_FL_KILL_CONN;
+
 	if (si_oc(si)->flags & CF_SHUTW) {
 		cs_close(cs);
 		si->state = SI_ST_DIS;
@@ -872,6 +895,9 @@ static void stream_int_shutw_conn(struct stream_interface *si)
 		 * However, if SI_FL_NOLINGER is explicitly set, we know there is
 		 * no risk so we close both sides immediately.
 		 */
+		if (si->flags & SI_FL_KILL_CONN)
+			cs->flags |= CS_FL_KILL_CONN;
+
 		if (si->flags & SI_FL_ERR) {
 			/* quick close, the socket is alredy shut anyway */
 		}
@@ -906,6 +932,8 @@ static void stream_int_shutw_conn(struct stream_interface *si)
 		/* we may have to close a pending connection, and mark the
 		 * response buffer as shutr
 		 */
+		if (si->flags & SI_FL_KILL_CONN)
+			cs->flags |= CS_FL_KILL_CONN;
 		cs_close(cs);
 		/* fall through */
 	case SI_ST_CER:
@@ -1176,7 +1204,7 @@ static void si_cs_recv_cb(struct conn_stream *cs)
 	 * recv().
 	 */
 	while (!(conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_WAIT_ROOM | CO_FL_HANDSHAKE)) &&
-	       !(cs->flags & CS_FL_ERROR) && !(ic->flags & CF_SHUTR)) {
+	       !(cs->flags & (CS_FL_ERROR|CS_FL_EOS)) && !(ic->flags & CF_SHUTR)) {
 		max = channel_recv_max(ic);
 
 		if (!max) {
@@ -1185,6 +1213,9 @@ static void si_cs_recv_cb(struct conn_stream *cs)
 		}
 
 		ret = conn->mux->rcv_buf(cs, ic->buf, max);
+		if (cs->flags & CS_FL_RCV_MORE)
+			si->flags |= SI_FL_WAIT_ROOM;
+
 		if (ret <= 0)
 			break;
 
@@ -1394,7 +1425,7 @@ void si_applet_wake_cb(struct stream_interface *si)
 	/* update the stream-int, channels, and possibly wake the stream up */
 	stream_int_notify(si);
 
-	/* stream_int_notify may pass throught checksnd and released some
+	/* stream_int_notify may pass through checksnd and released some
 	 * WAIT_ROOM flags. The process_stream will consider those flags
 	 * to wakeup the appctx but in the case the task is not in runqueue
 	 * we may have to wakeup the appctx immediately.

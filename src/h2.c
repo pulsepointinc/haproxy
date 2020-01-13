@@ -25,20 +25,38 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <stdint.h>
+#include <inttypes.h>
 #include <common/config.h>
 #include <common/h2.h>
 #include <common/http-hdr.h>
 #include <common/ist.h>
+#include <proto/h1.h>
 
+/* Looks into <ist> for forbidden characters for header values (0x00, 0x0A,
+ * 0x0D), starting at pointer <start> which must be within <ist>. Returns
+ * non-zero if such a character is found, 0 otherwise. When run on unlikely
+ * header match, it's recommended to first check for the presence of control
+ * chars using ist_find_ctl().
+ */
+static int has_forbidden_char(const struct ist ist, const char *start)
+{
+	do {
+		if ((uint8_t)*start <= 0x0d &&
+		    (1U << (uint8_t)*start) & ((1<<13) | (1<<10) | (1<<0)))
+			return 1;
+		start++;
+	} while (start < ist.ptr + ist.len);
+	return 0;
+}
 
 /* Prepare the request line into <*ptr> (stopping at <end>) from pseudo headers
  * stored in <phdr[]>. <fields> indicates what was found so far. This should be
  * called once at the detection of the first general header field or at the end
  * of the request if no general header field was found yet. Returns 0 on success
- * or a negative error code on failure.
+ * or a negative error code on failure. Upon success, <msgf> is updated with a
+ * few H2_MSGF_* flags indicating what was found while parsing.
  */
-static int h2_prepare_h1_reqline(uint32_t fields, struct ist *phdr, char **ptr, char *end)
+static int h2_prepare_h1_reqline(uint32_t fields, struct ist *phdr, char **ptr, char *end, unsigned int *msgf)
 {
 	char *out = *ptr;
 	int uri_idx = H2_PHDR_IDX_PATH;
@@ -62,6 +80,7 @@ static int h2_prepare_h1_reqline(uint32_t fields, struct ist *phdr, char **ptr, 
 		}
 		// otherwise OK ; let's use the authority instead of the URI
 		uri_idx = H2_PHDR_IDX_AUTH;
+		*msgf |= H2_MSGF_BODY_TUNNEL;
 	}
 	else if ((fields & (H2_PHDR_FND_METH|H2_PHDR_FND_SCHM|H2_PHDR_FND_PATH)) !=
 	         (H2_PHDR_FND_METH|H2_PHDR_FND_SCHM|H2_PHDR_FND_PATH)) {
@@ -83,7 +102,11 @@ static int h2_prepare_h1_reqline(uint32_t fields, struct ist *phdr, char **ptr, 
 		}
 	}
 
-	if (out + phdr[uri_idx].len + 1 + phdr[uri_idx].len + 11 > end) {
+	/* 7540#8.1.2.3: :path must not be empty */
+	if (!phdr[uri_idx].len)
+		goto fail;
+
+	if (out + phdr[H2_PHDR_IDX_METH].len + 1 + phdr[uri_idx].len + 11 > end) {
 		/* too large */
 		goto fail;
 	}
@@ -109,6 +132,10 @@ static int h2_prepare_h1_reqline(uint32_t fields, struct ist *phdr, char **ptr, 
  * for a max of <osize> bytes, and the amount of bytes emitted is returned. In
  * case of error, a negative error code is returned.
  *
+ * Upon success, <msgf> is filled with a few H2_MSGF_* flags indicating what
+ * was found while parsing. The caller must set it to zero in or H2_MSGF_BODY
+ * if a body is detected (!ES).
+ *
  * The headers list <list> must be composed of :
  *   - n.name != NULL, n.len  > 0 : literal header name
  *   - n.name == NULL, n.len  > 0 : indexed pseudo header name number <n.len>
@@ -120,15 +147,17 @@ static int h2_prepare_h1_reqline(uint32_t fields, struct ist *phdr, char **ptr, 
  * The Cookie header will be reassembled at the end, and for this, the <list>
  * will be used to create a linked list, so its contents may be destroyed.
  */
-int h2_make_h1_request(struct http_hdr *list, char *out, int osize)
+int h2_make_h1_request(struct http_hdr *list, char *out, int osize, unsigned int *msgf)
 {
 	struct ist phdr_val[H2_PHDR_NUM_ENTRIES];
 	char *out_end = out + osize;
+	const char *ctl;
 	uint32_t fields; /* bit mask of H2_PHDR_FND_* */
 	uint32_t idx;
 	int ck, lck; /* cookie index and last cookie index */
 	int phdr;
 	int ret;
+	int i;
 
 	lck = ck = -1; // no cookie for now
 	fields = 0;
@@ -139,8 +168,25 @@ int h2_make_h1_request(struct http_hdr *list, char *out, int osize)
 		}
 		else {
 			/* this can be any type of header */
+			/* RFC7540#8.1.2: upper case not allowed in header field names.
+			 * #10.3: header names must be valid (i.e. match a token).
+			 * For pseudo-headers we check from 2nd char and for other ones
+			 * from the first char, because HTTP_IS_TOKEN() also excludes
+			 * the colon.
+			 */
 			phdr = h2_str_to_phdr(list[idx].n);
+
+			for (i = !!phdr; i < list[idx].n.len; i++)
+				if ((uint8_t)(list[idx].n.ptr[i] - 'A') < 'Z' - 'A' || !HTTP_IS_TOKEN(list[idx].n.ptr[i]))
+					goto fail;
 		}
+
+		/* RFC7540#10.3: intermediaries forwarding to HTTP/1 must take care of
+		 * rejecting NUL, CR and LF characters.
+		 */
+		ctl = ist_find_ctl(list[idx].v);
+		if (unlikely(ctl) && has_forbidden_char(list[idx].v, ctl))
+			goto fail;
 
 		if (phdr > 0 && phdr < H2_PHDR_NUM_ENTRIES) {
 			/* insert a pseudo header by its index (in phdr) and value (in value) */
@@ -166,7 +212,7 @@ int h2_make_h1_request(struct http_hdr *list, char *out, int osize)
 		/* regular header field in (name,value) */
 		if (!(fields & H2_PHDR_FND_NONE)) {
 			/* no more pseudo-headers, time to build the request line */
-			ret = h2_prepare_h1_reqline(fields, phdr_val, &out, out_end);
+			ret = h2_prepare_h1_reqline(fields, phdr_val, &out, out_end, msgf);
 			if (ret != 0)
 				goto leave;
 			fields |= H2_PHDR_FND_NONE;
@@ -174,6 +220,21 @@ int h2_make_h1_request(struct http_hdr *list, char *out, int osize)
 
 		if (isteq(list[idx].n, ist("host")))
 			fields |= H2_PHDR_FND_HOST;
+
+		if ((*msgf & (H2_MSGF_BODY|H2_MSGF_BODY_TUNNEL|H2_MSGF_BODY_CL)) == H2_MSGF_BODY &&
+		    isteq(list[idx].n, ist("content-length")))
+			*msgf |= H2_MSGF_BODY_CL;
+
+		/* these ones are forbidden in requests (RFC7540#8.1.2.2) */
+		if (isteq(list[idx].n, ist("connection")) ||
+		    isteq(list[idx].n, ist("proxy-connection")) ||
+		    isteq(list[idx].n, ist("keep-alive")) ||
+		    isteq(list[idx].n, ist("upgrade")) ||
+		    isteq(list[idx].n, ist("transfer-encoding")))
+			goto fail;
+
+		if (isteq(list[idx].n, ist("te")) && !isteq(list[idx].v, ist("trailers")))
+			goto fail;
 
 		/* cookie requires special processing at the end */
 		if (isteq(list[idx].n, ist("cookie"))) {
@@ -205,9 +266,13 @@ int h2_make_h1_request(struct http_hdr *list, char *out, int osize)
 		*(out++) = '\n';
 	}
 
+	/* RFC7540#8.1.2.1 mandates to reject response pseudo-headers (:status) */
+	if (fields & H2_PHDR_FND_STAT)
+		goto fail;
+
 	/* Let's dump the request now if not yet emitted. */
 	if (!(fields & H2_PHDR_FND_NONE)) {
-		ret = h2_prepare_h1_reqline(fields, phdr_val, &out, out_end);
+		ret = h2_prepare_h1_reqline(fields, phdr_val, &out, out_end, msgf);
 		if (ret != 0)
 			goto leave;
 	}
@@ -225,6 +290,14 @@ int h2_make_h1_request(struct http_hdr *list, char *out, int osize)
 		out += 6 + phdr_val[H2_PHDR_IDX_AUTH].len;
 		*(out++) = '\r';
 		*(out++) = '\n';
+	}
+
+	if ((*msgf & (H2_MSGF_BODY|H2_MSGF_BODY_TUNNEL|H2_MSGF_BODY_CL)) == H2_MSGF_BODY) {
+		/* add chunked encoding */
+		if (out + 28 > out_end)
+			goto fail;
+		memcpy(out, "transfer-encoding: chunked\r\n", 28);
+		out += 28;
 	}
 
 	/* now we may have to build a cookie list. We'll dump the values of all

@@ -27,7 +27,7 @@
 #ifndef _COMMON_HPACK_TBL_H
 #define _COMMON_HPACK_TBL_H
 
-#include <stdint.h>
+#include <inttypes.h>
 #include <stdlib.h>
 #include <common/config.h>
 #include <common/http-hdr.h>
@@ -127,6 +127,7 @@ enum {
 	HPACK_ERR_MISSING_AUTHORITY,  /* :authority is missing with CONNECT */
 	HPACK_ERR_SCHEME_NOT_ALLOWED, /* :scheme not allowed with CONNECT */
 	HPACK_ERR_PATH_NOT_ALLOWED,   /* :path not allowed with CONNECT */
+	HPACK_ERR_INVALID_ARGUMENT,   /* an invalid argument was passed */
 };
 
 /* static header table as in RFC7541 Appendix A. [0] unused. */
@@ -154,6 +155,12 @@ static inline const struct hpack_dte *hpack_get_dte(const struct hpack_dht *dht,
 	return &dht->dte[idx];
 }
 
+/* returns non-zero if <idx> is valid for table <dht> */
+static inline int hpack_valid_idx(const struct hpack_dht *dht, uint32_t idx)
+{
+	return idx < dht->used + HPACK_SHT_SIZE;
+}
+
 /* return a pointer to the header name for entry <dte>. */
 static inline struct ist hpack_get_name(const struct hpack_dht *dht, const struct hpack_dte *dte)
 {
@@ -175,7 +182,7 @@ static inline struct ist hpack_get_value(const struct hpack_dht *dht, const stru
 }
 
 /* takes an idx, returns the associated name */
-static inline struct ist hpack_idx_to_name(const struct hpack_dht *dht, int idx)
+static inline struct ist hpack_idx_to_name(const struct hpack_dht *dht, uint32_t idx)
 {
 	const struct hpack_dte *dte;
 
@@ -190,7 +197,7 @@ static inline struct ist hpack_idx_to_name(const struct hpack_dht *dht, int idx)
 }
 
 /* takes an idx, returns the associated value */
-static inline struct ist hpack_idx_to_value(const struct hpack_dht *dht, int idx)
+static inline struct ist hpack_idx_to_value(const struct hpack_dht *dht, uint32_t idx)
 {
 	const struct hpack_dte *dte;
 
@@ -210,8 +217,10 @@ static inline struct ist hpack_idx_to_value(const struct hpack_dht *dht, int idx
  */
 static inline int hpack_dht_make_room(struct hpack_dht *dht, unsigned int needed)
 {
-	if (!dht->used || dht->used * 32 + dht->total + needed + 32 <= dht->size)
+	if (dht->used * 32 + dht->total + needed + 32 <= dht->size)
 		return 1;
+	else if (!dht->used)
+		return 0;
 
 	return __hpack_dht_make_room(dht, needed);
 }

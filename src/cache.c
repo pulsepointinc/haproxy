@@ -228,6 +228,7 @@ cache_store_http_forward_data(struct stream *s, struct filter *filter,
 							    MIN(bi_contig_data(msg->chn->buf), len - st->hdrs_len));
 				/* Rewind the buffer to forward all data */
 				b_rew(msg->chn->buf, st->hdrs_len);
+				st->hdrs_len = 0;
 				if (ret)
 					goto disable_cache;
 			}
@@ -377,13 +378,11 @@ int http_calc_maxage(struct stream *s, struct cache *cache)
 
 static void cache_free_blocks(struct shared_block *first, struct shared_block *block)
 {
-	if (first == block) {
-		struct cache_entry *object = (struct cache_entry *)first->data;
-		if (object->eb.key) {
-			eb32_delete(&object->eb);
-			object->eb.key = 0;
-		}
-	}
+	struct cache_entry *object = (struct cache_entry *)block->data;
+
+	if (first == block && object->eb.key)
+		eb32_delete(&object->eb);
+	object->eb.key = 0;
 }
 
 /*
@@ -401,7 +400,7 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	struct cache *cache = (struct cache *)rule->arg.act.p[0];
 	struct shared_context *shctx = shctx_ptr(cache);
 	struct cache_entry *object;
-
+	unsigned int key = *(unsigned int *)txn->cache_hash;
 
 	/* Don't cache if the response came from a cache */
 	if ((obj_type(s->target) == OBJ_TYPE_APPLET) &&
@@ -421,6 +420,10 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	if (txn->meth != HTTP_METH_GET)
 		goto out;
 
+	/* cache key was not computed */
+	if (!key)
+		goto out;
+
 	/* cache only 200 status code */
 	if (txn->status != 200)
 		goto out;
@@ -430,13 +433,9 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 	if (http_find_header2("Vary", 4, txn->rsp.chn->buf->p, &txn->hdr_idx, &ctx))
 		goto out;
 
-	/* we need to put this flag before using check_response_for_cacheability */
-	txn->flags |= TX_CACHEABLE;
+	check_response_for_cacheability(s, &s->res);
 
-	if (txn->status != 101)
-		check_response_for_cacheability(s, &s->res);
-
-	if (!(txn->flags & TX_CACHEABLE))
+	if (!(txn->flags & TX_CACHEABLE) || !(txn->flags & TX_CACHE_COOK))
 		goto out;
 
 	if ((msg->sov + msg->body_len) > (global.tune.bufsize - global.tune.maxrewrite))
@@ -450,6 +449,13 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 		goto out;
 	}
 	shctx_unlock(shctx);
+
+	/* the received memory is not initialized, we need at least to mark
+	 * the object as not indexed yet.
+	 */
+	object = (struct cache_entry *)first->data;
+	object->eb.node.leaf_p = NULL;
+	object->eb.key = 0;
 
 	/* reserve space for the cache_entry structure */
 	first->len = sizeof(struct cache_entry);
@@ -472,23 +478,20 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 			    filter->config->conf == rule->arg.act.p[0]) {
 				if (filter->ctx) {
 					struct cache_st *cache_ctx = filter->ctx;
+					struct cache_entry *old;
 
 					cache_ctx->first_block = first;
-					object = (struct cache_entry *)first->data;
 
-					object->eb.key = (*(unsigned int *)&txn->cache_hash);
+					object->eb.key = key;
 					memcpy(object->hash, txn->cache_hash, sizeof(object->hash));
 					/* Insert the node later on caching success */
 
 					shctx_lock(shctx);
-					if (entry_exist(cache, txn->cache_hash)) {
-						shctx_unlock(shctx);
-						if (filter->ctx) {
-							object->eb.key = 0;
-							pool_free(pool_head_cache_st, filter->ctx);
-							filter->ctx = NULL;
-						}
-						goto out;
+
+					old = entry_exist(cache, txn->cache_hash);
+					if (old) {
+						eb32_delete(&old->eb);
+						old->eb.key = 0;
 					}
 					shctx_unlock(shctx);
 
@@ -504,8 +507,6 @@ enum act_return http_action_store_cache(struct act_rule *rule, struct proxy *px,
 out:
 	/* if does not cache */
 	if (first) {
-		object = (struct cache_entry *)first->data;
-
 		shctx_lock(shctx);
 		first->len = 0;
 		object->eb.key = 0;
@@ -652,9 +653,9 @@ int sha1_hosturi(struct http_txn *txn)
 	chunk_strncat(trash, ctx.line + ctx.val, ctx.vlen);
 
 	/* now retrieve the path */
-	end = txn->req.chn->buf->p + txn->req.sl.rq.u + txn->req.sl.rq.u_l;
-	path = http_get_path(txn);
-	if (!path)
+	path = txn->req.chn->buf->p + txn->req.sl.rq.u;
+	end  = path + txn->req.sl.rq.u_l;
+	if (end == path || *path != '/')
 		return 0;
 	chunk_strncat(trash, path, end - path);
 
@@ -675,7 +676,15 @@ enum act_return http_action_req_cache_use(struct act_rule *rule, struct proxy *p
 	struct cache_entry *res;
 	struct cache *cache = (struct cache *)rule->arg.act.p[0];
 
-	sha1_hosturi(s->txn);
+	check_request_for_cacheability(s, &s->req);
+	if ((s->txn->flags & (TX_CACHE_IGNORE|TX_CACHEABLE)) == TX_CACHE_IGNORE)
+		return ACT_RET_CONT;
+
+	if (!sha1_hosturi(s->txn))
+		return ACT_RET_CONT;
+
+	if (s->txn->flags & TX_CACHE_IGNORE)
+		return ACT_RET_CONT;
 
 	shctx_lock(shctx_ptr(cache));
 	res = entry_exist(cache, s->txn->cache_hash);
@@ -765,17 +774,32 @@ int cfg_parse_cache(const char *file, int linenum, char **args, int kwm)
 			tmp_cache_config->maxblocks = 0;
 		}
 	} else if (strcmp(args[0], "total-max-size") == 0) {
-		int maxsize;
+		unsigned long int maxsize;
+		char *err;
 
 		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
 			err_code |= ERR_ABORT;
 			goto out;
 		}
 
-		/* size in megabytes */
-		maxsize = atoi(args[1]) * 1024 * 1024 / CACHE_BLOCKSIZE;
-		tmp_cache_config->maxblocks = maxsize;
+		maxsize = strtoul(args[1], &err, 10);
+		if (err == args[1] || *err != '\0') {
+			ha_warning("parsing [%s:%d]: total-max-size wrong value '%s'\n",
+			           file, linenum, args[1]);
+			err_code |= ERR_ABORT;
+			goto out;
+		}
 
+		if (maxsize > (UINT_MAX >> 20)) {
+			ha_warning("parsing [%s:%d]: \"total-max-size\" (%s) must not be greater than %u\n",
+			           file, linenum, args[1], UINT_MAX >> 20);
+			err_code |= ERR_ABORT;
+			goto out;
+		}
+
+		/* size in megabytes */
+		maxsize *= 1024 * 1024 / CACHE_BLOCKSIZE;
+		tmp_cache_config->maxblocks = maxsize;
 	} else if (strcmp(args[0], "max-age") == 0) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code)) {
 			err_code |= ERR_ABORT;
@@ -817,7 +841,7 @@ int cfg_post_parse_section_cache()
 
 		ret_shctx = shctx_init(&shctx, tmp_cache_config->maxblocks, CACHE_BLOCKSIZE, sizeof(struct cache), 1);
 
-		if (ret_shctx < 0) {
+		if (ret_shctx <= 0) {
 			if (ret_shctx == SHCTX_E_INIT_LOCK)
 				ha_alert("Unable to initialize the lock for the cache.\n");
 			else
@@ -960,9 +984,6 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 	struct cache* cache = appctx->ctx.cli.p0;
 	struct stream_interface *si = appctx->owner;
 
-	chunk_reset(&trash);
-
-
 	if (cache == NULL) {
 		cache = LIST_ELEM((caches).n, typeof(struct cache *), list);
 	}
@@ -972,9 +993,14 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 		unsigned int next_key;
 		struct cache_entry *entry;
 
-		chunk_appendf(&trash, "%p: %s (shctx:%p, available blocks:%d)\n", cache, cache->id, shctx_ptr(cache), shctx_ptr(cache)->nbav);
-
 		next_key = appctx->ctx.cli.i0;
+		if (!next_key) {
+			chunk_printf(&trash, "%p: %s (shctx:%p, available blocks:%d)\n", cache, cache->id, shctx_ptr(cache), shctx_ptr(cache)->nbav);
+			if (ci_putchk(si_ic(si), &trash) == -1) {
+				si_applet_cant_put(si);
+				return 0;
+			}
+		}
 
 		appctx->ctx.cli.p0 = cache;
 
@@ -984,11 +1010,12 @@ static int cli_io_handler_show_cache(struct appctx *appctx)
 			node = eb32_lookup_ge(&cache->entries, next_key);
 			if (!node) {
 				shctx_unlock(shctx_ptr(cache));
+				appctx->ctx.cli.i0 = 0;
 				break;
 			}
 
 			entry = container_of(node, struct cache_entry, eb);
-			chunk_appendf(&trash, "%p hash:%u size:%u (%u blocks), refcount:%u, expire:%d\n", entry, (*(unsigned int *)entry->hash), block_ptr(entry)->len, block_ptr(entry)->block_count, block_ptr(entry)->refcount, entry->expire - (int)now.tv_sec);
+			chunk_printf(&trash, "%p hash:%u size:%u (%u blocks), refcount:%u, expire:%d\n", entry, (*(unsigned int *)entry->hash), block_ptr(entry)->len, block_ptr(entry)->block_count, block_ptr(entry)->refcount, entry->expire - (int)now.tv_sec);
 
 			next_key = node->key + 1;
 			appctx->ctx.cli.i0 = next_key;

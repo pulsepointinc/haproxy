@@ -42,6 +42,7 @@
 #include <proto/listener.h>
 #include <proto/log.h>
 #include <proto/protocol.h>
+#include <proto/proto_tcp.h>
 #include <proto/task.h>
 
 static int uxst_bind_listener(struct listener *listener, char *errmsg, int errlen);
@@ -71,6 +72,7 @@ static struct protocol proto_unix = {
 	.disable_all = disable_all_listeners,
 	.get_src = uxst_get_src,
 	.get_dst = uxst_get_dst,
+	.drain = tcp_drain,
 	.pause = uxst_pause_listener,
 	.add = uxst_add_listener,
 	.listeners = LIST_HEAD_INIT(proto_unix.listeners),
@@ -146,7 +148,12 @@ static int uxst_find_compatible_fd(struct listener *l)
 					after_sockname++;
 				if (!strcmp(after_sockname, ".tmp"))
 					break;
-			}
+			/* abns sockets sun_path starts with a \0 */
+			} else if (un1->sun_path[0] == 0
+			    && un2->sun_path[0] == 0
+			    && !memcmp(&un1->sun_path[1], &un2->sun_path[1],
+			    sizeof(un1->sun_path) - 1))
+				break;
 		}
 		xfer_sock = xfer_sock->next;
 	}
@@ -157,7 +164,7 @@ static int uxst_find_compatible_fd(struct listener *l)
 		if (xfer_sock->prev)
 			xfer_sock->prev->next = xfer_sock->next;
 		if (xfer_sock->next)
-			xfer_sock->next->prev = xfer_sock->next->prev;
+			xfer_sock->next->prev = xfer_sock->prev;
 		free(xfer_sock);
 	}
 	return ret;
@@ -375,6 +382,9 @@ static int uxst_unbind_listener(struct listener *listener)
 /* Add <listener> to the list of unix stream listeners (port is ignored). The
  * listener's state is automatically updated from LI_INIT to LI_ASSIGNED.
  * The number of listeners for the protocol is updated.
+ *
+ * Must be called with proto_lock held.
+ *
  */
 static void uxst_add_listener(struct listener *listener, int port)
 {
@@ -396,7 +406,9 @@ static int uxst_pause_listener(struct listener *l)
 	if (((struct sockaddr_un *)&l->addr)->sun_path[0])
 		return 1;
 
-	unbind_listener(l);
+	/* Listener's lock already held. Call lockless version of
+	 * unbind_listener. */
+	do_unbind_listener(l, 1);
 	return 0;
 }
 
@@ -594,6 +606,8 @@ static int uxst_connect_server(struct connection *conn, int data, int delack)
  * loose them across the fork(). A call to uxst_enable_listeners() is needed
  * to complete initialization.
  *
+ * Must be called with proto_lock held.
+ *
  * The return value is composed from ERR_NONE, ERR_RETRYABLE and ERR_FATAL.
  */
 static int uxst_bind_listeners(struct protocol *proto, char *errmsg, int errlen)
@@ -613,6 +627,9 @@ static int uxst_bind_listeners(struct protocol *proto, char *errmsg, int errlen)
 /* This function stops all listening UNIX sockets bound to the protocol
  * <proto>. It does not detaches them from the protocol.
  * It always returns ERR_NONE.
+ *
+ * Must be called with proto_lock held.
+ *
  */
 static int uxst_unbind_listeners(struct protocol *proto)
 {

@@ -1131,6 +1131,9 @@ int tcp_bind_listener(struct listener *listener, char *errmsg, int errlen)
  * The sockets will be registered but not added to any fd_set, in order not to
  * loose them across the fork(). A call to enable_all_listeners() is needed
  * to complete initialization. The return value is composed from ERR_*.
+ *
+ * Must be called with proto_lock held.
+ *
  */
 static int tcp_bind_listeners(struct protocol *proto, char *errmsg, int errlen)
 {
@@ -1149,6 +1152,9 @@ static int tcp_bind_listeners(struct protocol *proto, char *errmsg, int errlen)
 /* Add <listener> to the list of tcpv4 listeners, on port <port>. The
  * listener's state is automatically updated from LI_INIT to LI_ASSIGNED.
  * The number of listeners for the protocol is updated.
+ *
+ * Must be called with proto_lock held.
+ *
  */
 static void tcpv4_add_listener(struct listener *listener, int port)
 {
@@ -1164,6 +1170,9 @@ static void tcpv4_add_listener(struct listener *listener, int port)
 /* Add <listener> to the list of tcpv6 listeners, on port <port>. The
  * listener's state is automatically updated from LI_INIT to LI_ASSIGNED.
  * The number of listeners for the protocol is updated.
+ *
+ * Must be called with proto_lock held.
+ *
  */
 static void tcpv6_add_listener(struct listener *listener, int port)
 {
@@ -1580,11 +1589,59 @@ smp_fetch_dport(const struct arg *args, struct sample *smp, const char *kw, void
 
 #ifdef TCP_INFO
 
-/* Returns some tcp_info data is its avalaible. "dir" must be set to 0 if
- * the client connection is require, otherwise it is set to 1. "val" represents
- * the required value. Use 0 for rtt and 1 for rttavg. "unit" is the expected unit
- * by default, the rtt is in us. Id "unit" is set to 0, the unit is us, if it is
- * set to 1, the untis are milliseconds.
+/* Validates the arguments passed to "fc_*" fetch keywords returning a time
+ * value. These keywords support an optional string representing the unit of the
+ * result: "us" for microseconds and "ms" for milliseconds". Returns 0 on error
+ * and non-zero if OK.
+ */
+static int val_fc_time_value(struct arg *args, char **err)
+{
+	if (args[0].type == ARGT_STR) {
+		if (strcmp(args[0].data.str.str, "us") == 0) {
+			free(args[0].data.str.str);
+			args[0].type = ARGT_SINT;
+			args[0].data.sint = TIME_UNIT_US;
+		}
+		else if (strcmp(args[0].data.str.str, "ms") == 0) {
+			free(args[0].data.str.str);
+			args[0].type = ARGT_SINT;
+			args[0].data.sint = TIME_UNIT_MS;
+		}
+		else {
+			memprintf(err, "expects 'us' or 'ms', got '%s'",
+				  args[0].data.str.str);
+			return 0;
+		}
+	}
+	else {
+		memprintf(err, "Unexpected arg type");
+		return 0;
+	}
+
+	return 1;
+}
+
+/* Validates the arguments passed to "fc_*" fetch keywords returning a
+ * counter. These keywords should be used without any keyword, but because of a
+ * bug in previous versions, an optional string argument may be passed. In such
+ * case, the argument is ignored and a warning is emitted. Returns 0 on error
+ * and non-zero if OK.
+ */
+static int var_fc_counter(struct arg *args, char **err)
+{
+	if (args[0].type != ARGT_STOP) {
+		ha_warning("no argument supported for 'fc_*' sample expressions returning counters.\n");
+		if (args[0].type == ARGT_STR)
+			free(args[0].data.str.str);
+		args[0].type = ARGT_STOP;
+	}
+
+	return 1;
+}
+
+/* Returns some tcp_info data if it's available. "dir" must be set to 0 if
+ * the client connection is required, otherwise it is set to 1. "val" represents
+ * the required value.
  * If the function fails it returns 0, otherwise it returns 1 and "result" is filled.
  */
 static inline int get_tcp_info(const struct arg *args, struct sample *smp,
@@ -1636,21 +1693,6 @@ static inline int get_tcp_info(const struct arg *args, struct sample *smp,
 	default: return 0;
 	}
 
-	/* Convert the value as expected. */
-	if (args) {
-		if (args[0].type == ARGT_STR) {
-			if (strcmp(args[0].data.str.str, "us") == 0) {
-				/* Do nothing. */
-			} else if (strcmp(args[0].data.str.str, "ms") == 0) {
-				smp->data.u.sint = (smp->data.u.sint + 500) / 1000;
-			} else
-				return 0;
-		} else if (args[0].type == ARGT_STOP) {
-			smp->data.u.sint = (smp->data.u.sint + 500) / 1000;
-		} else
-			return 0;
-	}
-
 	return 1;
 }
 
@@ -1660,6 +1702,11 @@ smp_fetch_fc_rtt(const struct arg *args, struct sample *smp, const char *kw, voi
 {
 	if (!get_tcp_info(args, smp, 0, 0))
 		return 0;
+
+	/* By default or if explicitly specified, convert rtt to ms */
+	if (!args || args[0].type == ARGT_STOP || args[0].data.sint == TIME_UNIT_MS)
+		smp->data.u.sint = (smp->data.u.sint + 500) / 1000;
+
 	return 1;
 }
 
@@ -1669,6 +1716,11 @@ smp_fetch_fc_rttvar(const struct arg *args, struct sample *smp, const char *kw, 
 {
 	if (!get_tcp_info(args, smp, 0, 1))
 		return 0;
+
+	/* By default or if explicitly specified, convert rttvar to ms */
+	if (!args || args[0].type == ARGT_STOP || args[0].data.sint == TIME_UNIT_MS)
+		smp->data.u.sint = (smp->data.u.sint + 500) / 1000;
+
 	return 1;
 }
 
@@ -1945,15 +1997,15 @@ static struct sample_fetch_kw_list sample_fetch_keywords = {ILH, {
 	{ "src_is_local", smp_fetch_src_is_local, 0, NULL, SMP_T_BOOL, SMP_USE_L4CLI },
 	{ "src_port", smp_fetch_sport, 0, NULL, SMP_T_SINT, SMP_USE_L4CLI },
 #ifdef TCP_INFO
-	{ "fc_rtt",           smp_fetch_fc_rtt,           ARG1(0,STR), NULL, SMP_T_SINT, SMP_USE_L4CLI },
-	{ "fc_rttvar",        smp_fetch_fc_rttvar,        ARG1(0,STR), NULL, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "fc_rtt",           smp_fetch_fc_rtt,           ARG1(0,STR), val_fc_time_value, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "fc_rttvar",        smp_fetch_fc_rttvar,        ARG1(0,STR), val_fc_time_value, SMP_T_SINT, SMP_USE_L4CLI },
 #if defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
-	{ "fc_unacked",       smp_fetch_fc_unacked,       ARG1(0,STR), NULL, SMP_T_SINT, SMP_USE_L4CLI },
-	{ "fc_sacked",        smp_fetch_fc_sacked,        ARG1(0,STR), NULL, SMP_T_SINT, SMP_USE_L4CLI },
-	{ "fc_retrans",       smp_fetch_fc_retrans,       ARG1(0,STR), NULL, SMP_T_SINT, SMP_USE_L4CLI },
-	{ "fc_fackets",       smp_fetch_fc_fackets,       ARG1(0,STR), NULL, SMP_T_SINT, SMP_USE_L4CLI },
-	{ "fc_lost",          smp_fetch_fc_lost,          ARG1(0,STR), NULL, SMP_T_SINT, SMP_USE_L4CLI },
-	{ "fc_reordering",    smp_fetch_fc_reordering,    ARG1(0,STR), NULL, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "fc_unacked",       smp_fetch_fc_unacked,       ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "fc_sacked",        smp_fetch_fc_sacked,        ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "fc_retrans",       smp_fetch_fc_retrans,       ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "fc_fackets",       smp_fetch_fc_fackets,       ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "fc_lost",          smp_fetch_fc_lost,          ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
+	{ "fc_reordering",    smp_fetch_fc_reordering,    ARG1(0,STR), var_fc_counter, SMP_T_SINT, SMP_USE_L4CLI },
 #endif // linux || freebsd || netbsd
 #endif // TCP_INFO
 	{ /* END */ },

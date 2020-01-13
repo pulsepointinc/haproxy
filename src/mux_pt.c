@@ -51,6 +51,9 @@ static int mux_pt_wake(struct connection *conn)
 
 	ret = cs->data_cb->wake ? cs->data_cb->wake(cs) : 0;
 
+	if (ret < 0)
+		return ret;
+
 	/* If we had early data, and we're done with the handshake
 	 * then whe know the data are safe, and we can remove the flag.
 	 */
@@ -151,7 +154,7 @@ static void mux_pt_shutw(struct conn_stream *cs, enum cs_shw_mode mode)
 	if (conn_xprt_ready(cs->conn) && cs->conn->xprt->shutw)
 		cs->conn->xprt->shutw(cs->conn, (mode == CS_SHW_NORMAL));
 	if (!(cs->flags & CS_FL_SHR))
-		conn_sock_shutw(cs->conn);
+		conn_sock_shutw(cs->conn, (mode == CS_SHW_NORMAL));
 	else
 		conn_full_close(cs->conn);
 }
@@ -214,6 +217,7 @@ const struct mux_ops mux_pt_ops = {
 	.detach = mux_pt_detach,
 	.shutr = mux_pt_shutr,
 	.shutw = mux_pt_shutw,
+	.flags = MX_FL_NONE,
 	.name = "PASS",
 };
 

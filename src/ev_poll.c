@@ -19,6 +19,7 @@
 
 #include <common/compat.h>
 #include <common/config.h>
+#include <common/hathreads.h>
 #include <common/ticks.h>
 #include <common/time.h>
 
@@ -73,11 +74,15 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 	for (updt_idx = 0; updt_idx < fd_nbupdt; updt_idx++) {
 		fd = fd_updt[updt_idx];
 
-		if (!fdtab[fd].owner)
-			continue;
-
 		HA_SPIN_LOCK(FD_LOCK, &fdtab[fd].lock);
-		fdtab[fd].updated = 0;
+		fdtab[fd].update_mask &= ~tid_bit;
+
+		if (!fdtab[fd].owner) {
+			activity[tid].poll_drop++;
+			HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
+			continue;
+		}
+
 		fdtab[fd].new = 0;
 
 		eo = fdtab[fd].state;
@@ -100,6 +105,54 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 			HA_SPIN_UNLOCK(POLL_LOCK, &poll_lock);
 		}
 	}
+	HA_SPIN_LOCK(FD_UPDATE_LOCK, &fd_updt_lock);
+	for (fd = update_list.first; fd != -1; fd = fdtab[fd].update.next) {
+		HA_SPIN_LOCK(FD_LOCK, &fdtab[fd].lock);
+		if (fdtab[fd].update_mask & tid_bit) {
+			/* Cheat a bit, as the state is global to all pollers
+			 * we don't need every thread ot take care of the
+			 * update.
+			 */
+			fdtab[fd].update_mask &= ~all_threads_mask;
+			done_update_polling(fd);
+		} else {
+			HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
+			continue;
+		}
+
+		if (!fdtab[fd].owner) {
+			activity[tid].poll_drop++;
+			HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
+			continue;
+		}
+
+		fdtab[fd].new = 0;
+
+		eo = fdtab[fd].state;
+		en = fd_compute_new_polled_status(eo);
+		fdtab[fd].state = en;
+		HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
+
+		if ((eo ^ en) & FD_EV_POLLED_RW) {
+			/* poll status changed, update the lists */
+			HA_SPIN_LOCK(POLL_LOCK, &poll_lock);
+			if ((eo & ~en) & FD_EV_POLLED_R)
+				hap_fd_clr(fd, fd_evts[DIR_RD]);
+			else if ((en & ~eo) & FD_EV_POLLED_R)
+				hap_fd_set(fd, fd_evts[DIR_RD]);
+
+			if ((eo & ~en) & FD_EV_POLLED_W)
+				hap_fd_clr(fd, fd_evts[DIR_WR]);
+			else if ((en & ~eo) & FD_EV_POLLED_W)
+				hap_fd_set(fd, fd_evts[DIR_WR]);
+			HA_SPIN_UNLOCK(POLL_LOCK, &poll_lock);
+		}
+
+	}
+	HA_SPIN_UNLOCK(FD_UPDATE_LOCK, &fd_updt_lock);
+
+	thread_harmless_now();
+
 	fd_nbupdt = 0;
 
 	nbfd = 0;
@@ -111,13 +164,21 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 			continue;
 
 		for (count = 0, fd = fds * 8*sizeof(**fd_evts); count < 8*sizeof(**fd_evts) && fd < maxfd; count++, fd++) {
-
-			if (!fdtab[fd].owner || !(fdtab[fd].thread_mask & tid_bit))
-				continue;
-
 			sr = (rn >> count) & 1;
 			sw = (wn >> count) & 1;
 			if ((sr|sw)) {
+				if (!fdtab[fd].owner) {
+					/* should normally not happen here except
+					 * due to rare thread concurrency
+					 */
+					continue;
+				}
+
+				if (!(fdtab[fd].thread_mask & tid_bit)) {
+					activity[tid].poll_skip++;
+					continue;
+				}
+
 				poll_events[nbfd].fd = fd;
 				poll_events[nbfd].events = (sr ? (POLLIN | POLLRDHUP) : 0) | (sw ? POLLOUT : 0);
 				nbfd++;
@@ -128,8 +189,10 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 	/* now let's wait for events */
 	if (!exp)
 		wait_time = MAX_DELAY_MS;
-	else if (tick_is_expired(exp, now_ms))
+	else if (tick_is_expired(exp, now_ms)) {
+		activity[tid].poll_exp++;
 		wait_time = 0;
+	}
 	else {
 		wait_time = TICKS_TO_MS(tick_remain(now_ms, exp)) + 1;
 		if (wait_time > MAX_DELAY_MS)
@@ -140,6 +203,8 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 	status = poll(poll_events, nbfd, wait_time);
 	tv_update_date(wait_time, status);
 	measure_idle();
+
+	thread_harmless_end();
 
 	for (count = 0; status > 0 && count < nbfd; count++) {
 		unsigned int n;
@@ -152,8 +217,10 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 		/* ok, we found one active fd */
 		status--;
 
-		if (!fdtab[fd].owner)
+		if (!fdtab[fd].owner) {
+			activity[tid].poll_dead++;
 			continue;
+		}
 
 		/* it looks complicated but gcc can optimize it away when constants
 		 * have same values... In fact it depends on gcc :-(
@@ -205,7 +272,7 @@ REGPRM1 static int _do_init(struct poller *p)
 	int fd_evts_bytes;
 
 	p->private = NULL;
-	fd_evts_bytes = (global.maxsock + sizeof(**fd_evts) - 1) / sizeof(**fd_evts) * sizeof(**fd_evts);
+	fd_evts_bytes = (global.maxsock + sizeof(**fd_evts) * 8 - 1) / (sizeof(**fd_evts) * 8) * sizeof(**fd_evts);
 
 	if ((fd_evts[DIR_RD] = calloc(1, fd_evts_bytes)) == NULL)
 		goto fail_srevt;

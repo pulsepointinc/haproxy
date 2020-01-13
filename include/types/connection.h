@@ -45,7 +45,7 @@ struct server;
 struct pipe;
 
 
-/* A connection handle is how we differenciate two connections on the lower
+/* A connection handle is how we differentiate two connections on the lower
  * layers. It usually is a file descriptor but can be a connection id.
  */
 union conn_handle {
@@ -68,7 +68,9 @@ enum {
 
 
 	CS_FL_ERROR         = 0x00000100,  /* a fatal error was reported */
+	CS_FL_RCV_MORE      = 0x00000200,  /* more bytes to receive but not enough room */
 	CS_FL_EOS           = 0x00001000,  /* End of stream */
+	CS_FL_KILL_CONN     = 0x00002000,  /* must kill the connection when the CS closes */
 };
 
 /* cs_shutr() modes */
@@ -254,6 +256,12 @@ enum {
 	XPRT_ENTRIES /* must be last one */
 };
 
+/* MUX-specific flags */
+enum {
+	MX_FL_NONE        = 0x00000000,
+	MX_FL_CLEAN_ABRT  = 0x00000001, /* abort is clearly reported as an error */
+};
+
 /* xprt_ops describes transport-layer operations for a connection. They
  * generally run over a socket-based control layer, but not always. Some
  * of them are used for data transfer with the upper layer (rcv_*, snd_*)
@@ -298,6 +306,8 @@ struct mux_ops {
 
 	struct conn_stream *(*attach)(struct connection *); /* Create and attach a conn_stream to an outgoing connection */
 	void (*detach)(struct conn_stream *); /* Detach a conn_stream from an outgoing connection, when the request is done */
+	void (*show_fd)(struct chunk *, struct connection *); /* append some data about connection into chunk for "show fd" */
+	unsigned int flags;                           /* some flags characterizing the mux's capabilities (MX_FL_*) */
 	char name[8];                                 /* mux layer name, zero-terminated */
 };
 

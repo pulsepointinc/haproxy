@@ -613,16 +613,20 @@ int parse_process_number(const char *arg, unsigned long *proc, int *autoinc, cha
 	else if (strcmp(arg, "even") == 0)
 		*proc |= (~0UL/3UL) << 1; /* 0xAAA...AAA */
 	else {
-		char *dash;
+		const char *p, *dash = NULL;
 		unsigned int low, high;
 
-		if (!isdigit((int)*arg)) {
-			memprintf(err, "'%s' is not a valid number.\n", arg);
-			return -1;
+		for (p = arg; *p; p++) {
+			if (*p == '-' && !dash)
+				dash = p;
+			else if (!isdigit((int)*p)) {
+				memprintf(err, "'%s' is not a valid number/range.", arg);
+				return -1;
+			}
 		}
 
 		low = high = str2uic(arg);
-		if ((dash = strchr(arg, '-')) != NULL)
+		if (dash)
 			high = ((!*(dash+1)) ? LONGBITS : str2uic(dash + 1));
 
 		if (high < low) {
@@ -646,6 +650,7 @@ int parse_process_number(const char *arg, unsigned long *proc, int *autoinc, cha
 	return 0;
 }
 
+#ifdef USE_CPU_AFFINITY
 /* Parse cpu sets. Each CPU set is either a unique number between 0 and
  * <LONGBITS> or a range with two such numbers delimited by a dash
  * ('-'). Multiple CPU numbers or ranges may be specified. On success, it
@@ -687,6 +692,8 @@ static unsigned long parse_cpu_set(const char **args, unsigned long *cpu_set, ch
 	}
 	return 0;
 }
+#endif
+
 /*
  * parse a line in a <global> section. Returns the error code, 0 if OK, or
  * any combination of :
@@ -719,7 +726,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			if (!strcmp(args[1], "no-exit-on-failure")) {
 				global.tune.options |= GTUNE_NOEXIT_ONFAILURE;
 			} else {
-				ha_alert("parsing [%s:%d] : '%s' only supports 'exit-on-failure' option.\n", file, linenum, args[0]);
+				ha_alert("parsing [%s:%d] : '%s' only supports 'no-exit-on-failure' option.\n", file, linenum, args[0]);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
 			}
@@ -782,6 +789,8 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 		global.tune.maxpollevents = atol(args[1]);
 	}
 	else if (!strcmp(args[0], "tune.maxaccept")) {
+		long max;
+
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
 			goto out;
 		if (global.tune.maxaccept != 0) {
@@ -794,7 +803,13 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		global.tune.maxaccept = atol(args[1]);
+		max = atol(args[1]);
+		if (/*max < -1 || */max > INT_MAX) {
+			ha_alert("parsing [%s:%d] : '%s' expects -1 or an integer from 0 to INT_MAX.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.tune.maxaccept = max;
 	}
 	else if (!strcmp(args[0], "tune.chksize")) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
@@ -1151,21 +1166,13 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		global.nbthread = atol(args[1]);
-		if (global.nbthread < 1 || global.nbthread > LONGBITS) {
-			ha_alert("parsing [%s:%d] : '%s' must be between 1 and %d (was %d).\n",
-				 file, linenum, args[0], LONGBITS, global.nbthread);
+		global.nbthread = parse_nbthread(args[1], &errmsg);
+		if (!global.nbthread) {
+			ha_alert("parsing [%s:%d] : '%s' %s.\n",
+				 file, linenum, args[0], errmsg);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-#ifndef USE_THREAD
-		if (global.nbthread > 1) {
-			ha_alert("HAProxy is not compiled with threads support, please check build options for USE_THREAD.\n");
-			global.nbthread = 1;
-			err_code |= ERR_ALERT | ERR_FATAL;
-			goto out;
-		}
-#endif
 	}
 	else if (!strcmp(args[0], "maxconn")) {
 		if (alertif_too_many_args(1, file, linenum, args, &err_code))
@@ -1778,7 +1785,7 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			}
 
 			/* Mapping at the thread level */
-			for (j = 0; j < LONGBITS; j++) {
+			for (j = 0; j < MAX_THREADS; j++) {
 				/* Np mapping for this thread */
 				if (!(thread & (1UL << j)))
 					continue;
@@ -2792,14 +2799,14 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			curproxy->server_id_hdr_name = strdup(defproxy.server_id_hdr_name);
 		}
 
+		/* initialize error relocations */
+		for (rc = 0; rc < HTTP_ERR_SIZE; rc++)
+			chunk_dup(&curproxy->errmsg[rc], &defproxy.errmsg[rc]);
+
 		if (curproxy->cap & PR_CAP_FE) {
 			curproxy->maxconn = defproxy.maxconn;
 			curproxy->backlog = defproxy.backlog;
 			curproxy->fe_sps_lim = defproxy.fe_sps_lim;
-
-			/* initialize error relocations */
-			for (rc = 0; rc < HTTP_ERR_SIZE; rc++)
-				chunk_dup(&curproxy->errmsg[rc], &defproxy.errmsg[rc]);
 
 			curproxy->to_log = defproxy.to_log & ~LW_COOKIE & ~LW_REQHDR & ~ LW_RSPHDR;
 		}
@@ -2849,7 +2856,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 			if (defproxy.url_param_name)
 				curproxy->url_param_name = strdup(defproxy.url_param_name);
-			curproxy->url_param_len = defproxy.url_param_len;
+			curproxy->url_param_len   = defproxy.url_param_len;
+			curproxy->uri_whole       = defproxy.uri_whole;
+			curproxy->uri_len_limit   = defproxy.uri_len_limit;
+			curproxy->uri_dirs_depth1 = defproxy.uri_dirs_depth1;
 
 			if (defproxy.hh_name)
 				curproxy->hh_name = strdup(defproxy.hh_name);
@@ -3132,7 +3142,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				if (code) {
 					if (err && *err) {
 						indent_msg(&err, 2);
-						ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err);
+						if (((code & (ERR_WARN|ERR_ALERT)) == ERR_WARN))
+							ha_warning("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err);
+						else
+							ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err);
 					}
 					else
 						ha_alert("parsing [%s:%d] : '%s %s' : error encountered while processing '%s'.\n",
@@ -3405,11 +3418,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 					goto out;
 				}
 
-				if (*args[cur_arg + 1] != '.' || !strchr(args[cur_arg + 1] + 1, '.')) {
-					/* rfc2109, 4.3.2 Rejecting Cookies */
-					ha_warning("parsing [%s:%d]: domain '%s' contains no embedded"
-						   " dots nor does not start with a dot."
-						   " RFC forbids it, this configuration may not work properly.\n",
+				if (!strchr(args[cur_arg + 1], '.')) {
+					/* rfc6265, 5.2.3 The Domain Attribute */
+					ha_warning("parsing [%s:%d]: domain '%s' contains no embedded dot,"
+						   " this configuration may not work properly (see RFC6265#5.2.3).\n",
 						   file, linenum, args[cur_arg + 1]);
 					err_code |= ERR_WARN;
 				}
@@ -4046,7 +4058,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
-		if (warnifnotcap(curproxy, PR_CAP_FE|PR_CAP_BE, file, linenum, args[0], NULL))
+		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
 			err_code |= ERR_WARN;
 
 		if (strcmp(args[1], "if") != 0 && strcmp(args[1], "unless") != 0) {
@@ -4081,6 +4093,13 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 	else if (!strcmp(args[0], "stick-table")) {
 		int myidx = 1;
 		struct proxy *other;
+
+		if (curproxy == &defproxy) {
+			ha_alert("parsing [%s:%d] : 'stick-table' is not supported in 'defaults' section.\n",
+				 file, linenum);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
 
 		other = proxy_tbl_by_name(curproxy->id);
 		if (other) {
@@ -4804,6 +4823,12 @@ stats_error_parsing:
 			free(curproxy->conf.lfs_file);
 			curproxy->conf.lfs_file = strdup(curproxy->conf.args.file);
 			curproxy->conf.lfs_line = curproxy->conf.args.line;
+
+			if (curproxy != &defproxy && !(curproxy->cap & PR_CAP_FE)) {
+				ha_warning("parsing [%s:%d] : backend '%s' : 'option httplog' directive is ignored in backends.\n",
+					file, linenum, curproxy->id);
+				err_code |= ERR_WARN;
+			}
 		}
 		else if (!strcmp(args[1], "tcplog")) {
 			if (curproxy->conf.logformat_string && curproxy == &defproxy) {
@@ -4831,6 +4856,12 @@ stats_error_parsing:
 
 			if (alertif_too_many_args_idx(0, 1, file, linenum, args, &err_code))
 				goto out;
+
+			if (curproxy != &defproxy && !(curproxy->cap & PR_CAP_FE)) {
+				ha_warning("parsing [%s:%d] : backend '%s' : 'option tcplog' directive is ignored in backends.\n",
+					file, linenum, curproxy->id);
+				err_code |= ERR_WARN;
+			}
 		}
 		else if (!strcmp(args[1], "tcpka")) {
 			/* enable TCP keep-alives on client and server streams */
@@ -5068,7 +5099,7 @@ stats_error_parsing:
 									((unsigned char) (packetlen >> 16) & 0xff));
 
 								curproxy->check_req[3] = 1;
-								curproxy->check_req[5] = 130;
+								curproxy->check_req[5] = 0x82; // 130
 								curproxy->check_req[11] = 1;
 								curproxy->check_req[12] = 33;
 								memcpy(&curproxy->check_req[36], mysqluser, userlen);
@@ -5094,7 +5125,7 @@ stats_error_parsing:
 								((unsigned char) (packetlen >> 16) & 0xff));
 
 							curproxy->check_req[3] = 1;
-							curproxy->check_req[5] = 128;
+							curproxy->check_req[5] = 0x80;
 							curproxy->check_req[8] = 1;
 							memcpy(&curproxy->check_req[9], mysqluser, userlen);
 							curproxy->check_req[9 + userlen + 1 + 1]     = 1;
@@ -7408,32 +7439,31 @@ next_line:
 		list_for_each_entry(ics, &sections, list) {
 			if (strcmp(args[0], ics->section_name) == 0) {
 				cursection = ics->section_name;
+				pcs = cs;
 				cs = ics;
 				break;
 			}
 		}
 
+		if (pcs && pcs->post_section_parser) {
+			err_code |= pcs->post_section_parser();
+			if (err_code & ERR_ABORT)
+				goto err;
+		}
+		pcs = NULL;
+
 		if (!cs) {
 			ha_alert("parsing [%s:%d]: unknown keyword '%s' out of section.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 		} else {
-			/* else it's a section keyword */
-
-			if (pcs != cs && pcs && pcs->post_section_parser) {
-				err_code |= pcs->post_section_parser();
-				if (err_code & ERR_ABORT)
-					goto err;
-			}
-
 			err_code |= cs->section_parser(file, linenum, args, kwm);
 			if (err_code & ERR_ABORT)
 				goto err;
 		}
-		pcs = cs;
 	}
 
-	if (pcs == cs && pcs && pcs->post_section_parser)
-		err_code |= pcs->post_section_parser();
+	if (cs && cs->post_section_parser)
+		err_code |= cs->post_section_parser();
 
 err:
 	free(cfg_scope);
@@ -7615,7 +7645,7 @@ int check_config_validity()
 			if (curproxy->mode == PR_MODE_HTTP && global.tune.bufsize < 16384) {
 #ifdef OPENSSL_NPN_NEGOTIATED
 				/* check NPN */
-				if (bind_conf->ssl_conf.npn_str && strcmp(bind_conf->ssl_conf.npn_str, "\002h2") == 0) {
+				if (bind_conf->ssl_conf.npn_str && strstr(bind_conf->ssl_conf.npn_str, "\002h2")) {
 					ha_alert("config : HTTP frontend '%s' enables HTTP/2 via NPN at [%s:%d], so global.tune.bufsize must be at least 16384 bytes (%d now).\n",
 						 curproxy->id, bind_conf->file, bind_conf->line, global.tune.bufsize);
 					cfgerr++;
@@ -7623,7 +7653,7 @@ int check_config_validity()
 #endif
 #ifdef TLSEXT_TYPE_application_layer_protocol_negotiation
 				/* check ALPN */
-				if (bind_conf->ssl_conf.alpn_str && strcmp(bind_conf->ssl_conf.alpn_str, "\002h2") == 0) {
+				if (bind_conf->ssl_conf.alpn_str && strstr(bind_conf->ssl_conf.alpn_str, "\002h2")) {
 					ha_alert("config : HTTP frontend '%s' enables HTTP/2 via ALPN at [%s:%d], so global.tune.bufsize must be at least 16384 bytes (%d now).\n",
 						 curproxy->id, bind_conf->file, bind_conf->line, global.tune.bufsize);
 					cfgerr++;
@@ -7632,6 +7662,29 @@ int check_config_validity()
 			} /* HTTP && bufsize < 16384 */
 #endif
 
+			/* detect and address thread affinity inconsistencies */
+			nbproc = 0;
+			if (bind_conf->bind_proc)
+				nbproc = my_ffsl(bind_conf->bind_proc) - 1;
+
+			mask = bind_conf->bind_thread[nbproc];
+			if (mask && !(mask & all_threads_mask)) {
+				unsigned long new_mask = 0;
+
+				while (mask) {
+					new_mask |= mask & all_threads_mask;
+					mask >>= global.nbthread;
+				}
+
+				for (nbproc = 0; nbproc < LONGBITS; nbproc++) {
+					if (!bind_conf->bind_proc || (bind_conf->bind_proc & (1UL << nbproc)))
+						bind_conf->bind_thread[nbproc] = new_mask;
+				}
+				ha_warning("Proxy '%s': the thread range specified on the 'process' directive of 'bind %s' at [%s:%d] only refers to thread numbers out of the range defined by the global 'nbthread' directive. The thread numbers were remapped to existing threads instead (mask 0x%lx).\n",
+					   curproxy->id, bind_conf->arg, bind_conf->file, bind_conf->line, new_mask);
+			}
+
+			/* detect process and nbproc affinity inconsistencies */
 			if (!bind_conf->bind_proc)
 				continue;
 
@@ -7678,7 +7731,7 @@ int check_config_validity()
 			break;
 		}
 
-		if ((curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->conf.listeners)) {
+		if (curproxy != global.stats_fe && (curproxy->cap & PR_CAP_FE) && LIST_ISEMPTY(&curproxy->conf.listeners)) {
 			ha_warning("config : %s '%s' has no 'bind' directive. Please declare it as a backend if this was intended.\n",
 				   proxy_type_str(curproxy), curproxy->id);
 			err_code |= ERR_WARN;
@@ -7960,6 +8013,11 @@ int check_config_validity()
 					 curproxy->id, mrule->table.name ? mrule->table.name : curproxy->id);
 				cfgerr++;
 			}
+			else if (curproxy->bind_proc & ~target->bind_proc) {
+				ha_alert("Proxy '%s': stick-table '%s' referenced 'stick-store' rule not present on all processes covered by proxy '%s'.\n",
+				         curproxy->id, target->id, curproxy->id);
+				cfgerr++;
+			}
 			else {
 				free((void *)mrule->table.name);
 				mrule->table.t = &(target->table);
@@ -7991,6 +8049,11 @@ int check_config_validity()
 			else if (!stktable_compatible_sample(mrule->expr, target->table.type)) {
 				ha_alert("Proxy '%s': type of fetch not usable with type of stick-table '%s'.\n",
 					 curproxy->id, mrule->table.name ? mrule->table.name : curproxy->id);
+				cfgerr++;
+			}
+			else if (curproxy->bind_proc & ~target->bind_proc) {
+				ha_alert("Proxy '%s': stick-table '%s' referenced 'stick-store' rule not present on all processes covered by proxy '%s'.\n",
+				         curproxy->id, target->id, curproxy->id);
 				cfgerr++;
 			}
 			else {
@@ -8687,6 +8750,9 @@ out_uri_auth_compat:
 			}
 #endif
 
+			if ((curproxy->mode != PR_MODE_HTTP) && (curproxy->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR)
+				curproxy->options &= ~PR_O_REUSE_MASK;
+
 			if ((curproxy->options & PR_O_REUSE_MASK) != PR_O_REUSE_NEVR) {
 				if ((curproxy->conn_src.opts & CO_SRC_TPROXY_MASK) == CO_SRC_TPROXY_CLI ||
 				    (curproxy->conn_src.opts & CO_SRC_TPROXY_MASK) == CO_SRC_TPROXY_CIP ||
@@ -8789,6 +8855,33 @@ out_uri_auth_compat:
 					curproxy->be_rsp_ana |= AN_RES_FLT_HTTP_HDRS;
 				}
 			}
+		}
+
+		/* initialize idle conns lists */
+		for (newsrv = curproxy->srv; newsrv; newsrv = newsrv->next) {
+			int i;
+
+			newsrv->priv_conns = calloc(global.nbthread, sizeof(*newsrv->priv_conns));
+			newsrv->idle_conns = calloc(global.nbthread, sizeof(*newsrv->idle_conns));
+			newsrv->safe_conns = calloc(global.nbthread, sizeof(*newsrv->safe_conns));
+
+			if (!newsrv->priv_conns || !newsrv->idle_conns || !newsrv->safe_conns) {
+				free(newsrv->safe_conns); newsrv->safe_conns = NULL;
+				free(newsrv->idle_conns); newsrv->idle_conns = NULL;
+				free(newsrv->priv_conns); newsrv->priv_conns = NULL;
+				ha_alert("parsing [%s:%d] : failed to allocate idle connections for server '%s'.\n",
+					 newsrv->conf.file, newsrv->conf.line, newsrv->id);
+				cfgerr++;
+				continue;
+			}
+
+			for (i = 0; i < global.nbthread; i++) {
+				LIST_INIT(&newsrv->priv_conns[i]);
+				LIST_INIT(&newsrv->idle_conns[i]);
+				LIST_INIT(&newsrv->safe_conns[i]);
+			}
+
+			LIST_INIT(&newsrv->update_status);
 		}
 	}
 
@@ -8927,9 +9020,8 @@ out_uri_auth_compat:
 			 * is bound to. Rememeber that maxaccept = -1 must be kept as it is
 			 * used to disable the limit.
 			 */
-			if (listener->maxaccept > 0) {
-				if (nbproc > 1)
-					listener->maxaccept = (listener->maxaccept + 1) / 2;
+			if (listener->maxaccept > 0 && nbproc > 1) {
+				listener->maxaccept = (listener->maxaccept + 1) / 2;
 				listener->maxaccept = (listener->maxaccept + nbproc - 1) / nbproc;
 			}
 
@@ -9071,7 +9163,12 @@ out_uri_auth_compat:
 				curpeers->peers_fe = NULL;
 			}
 			else {
-				peers_init_sync(curpeers);
+				if (!peers_init_sync(curpeers)) {
+					ha_alert("Peers section '%s': out of memory, giving up on peers.\n",
+						 curpeers->id);
+					cfgerr++;
+					break;
+				}
 				last = &curpeers->next;
 				continue;
 			}

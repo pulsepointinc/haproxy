@@ -90,6 +90,8 @@ extern unsigned int nb_tasks_cur;
 extern unsigned int niced_tasks;  /* number of niced tasks in the run queue */
 extern struct pool_head *pool_head_task;
 extern struct pool_head *pool_head_notification;
+extern THREAD_LOCAL struct task *curr_task; /* task currently running or NULL */
+extern THREAD_LOCAL struct eb32sc_node *rq_next; /* Next task to be potentially run */
 
 __decl_hathreads(extern HA_SPINLOCK_T rq_lock);  /* spin lock related to run queue */
 __decl_hathreads(extern HA_SPINLOCK_T wq_lock);  /* spin lock related to wait queue */
@@ -177,8 +179,11 @@ static inline struct task *__task_unlink_rq(struct task *t)
 static inline struct task *task_unlink_rq(struct task *t)
 {
 	HA_SPIN_LOCK(TASK_RQ_LOCK, &rq_lock);
-	if (likely(task_in_rq(t)))
+	if (likely(task_in_rq(t))) {
+		if (&t->rq == rq_next)
+			rq_next = eb32sc_next(rq_next, tid_bit);
 		__task_unlink_rq(t);
+	}
 	HA_SPIN_UNLOCK(TASK_RQ_LOCK, &rq_lock);
 	return t;
 }
@@ -230,13 +235,25 @@ static inline struct task *task_new(unsigned long thread_mask)
  * Free a task. Its context must have been freed since it will be lost.
  * The task count is decremented.
  */
-static inline void task_free(struct task *t)
+static inline void __task_free(struct task *t)
 {
 	pool_free(pool_head_task, t);
 	if (unlikely(stopping))
 		pool_flush(pool_head_task);
 	HA_ATOMIC_SUB(&nb_tasks, 1);
 }
+
+static inline void task_free(struct task *t)
+{
+	/* There's no need to protect t->state with a lock, as the task
+	 * has to run on the current thread.
+	 */
+	if (t == curr_task || !(t->state & TASK_RUNNING))
+		__task_free(t);
+	else
+		t->process = NULL;
+}
+
 
 /* Place <task> into the wait queue, where it may already be. If the expiration
  * timer is infinite, do nothing and rely on wake_expired_task to clean up.
@@ -304,6 +321,9 @@ static inline struct notification *notification_new(struct list *purge, struct l
 /* This function purge all the pending signals when the LUA execution
  * is finished. This prevent than a coprocess try to wake a deleted
  * task. This function remove the memory associated to the signal.
+ * The purge list is not locked because it is owned by only one
+ * process. before browsing this list, the caller must ensure to be
+ * the only one browser.
  */
 static inline void notification_purge(struct list *purge)
 {
@@ -323,9 +343,31 @@ static inline void notification_purge(struct list *purge)
 	}
 }
 
+/* In some cases, the disconnected notifications must be cleared.
+ * This function just release memory blocs. The purge list is not
+ * locked because it is owned by only one process. Before browsing
+ * this list, the caller must ensure to be the only one browser.
+ * The "com" is not locked because when com->task is NULL, the
+ * notification is no longer used.
+ */
+static inline void notification_gc(struct list *purge)
+{
+	struct notification *com, *back;
+
+	/* Delete all pending communication signals. */
+	list_for_each_entry_safe (com, back, purge, purge_me) {
+		if (com->task)
+			continue;
+		LIST_DEL(&com->purge_me);
+		pool_free(pool_head_notification, com);
+	}
+}
+
 /* This function sends signals. It wakes all the tasks attached
  * to a list head, and remove the signal, and free the used
- * memory.
+ * memory. The wake list is not locked because it is owned by
+ * only one process. before browsing this list, the caller must
+ * ensure to be the only one browser.
  */
 static inline void notification_wake(struct list *wake)
 {
@@ -345,6 +387,26 @@ static inline void notification_wake(struct list *wake)
 		HA_SPIN_UNLOCK(NOTIF_LOCK, &com->lock);
 	}
 }
+
+/* This function returns true is some notification are pending
+ */
+static inline int notification_registered(struct list *wake)
+{
+	return !LIST_ISEMPTY(wake);
+}
+
+/* adds list item <item> to work list <work> and wake up the associated task */
+static inline void work_list_add(struct work_list *work, struct list *item)
+{
+	LIST_ADDQ_LOCKED(&work->head, item);
+	task_wakeup(work->task, TASK_WOKEN_OTHER);
+}
+
+struct work_list *work_list_create(int nbthread,
+                                   struct task *(*fct)(struct task *),
+                                   void *arg);
+
+void work_list_destroy(struct work_list *work, int nbthread);
 
 /*
  * This does 3 things :

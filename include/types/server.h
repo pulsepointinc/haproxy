@@ -126,10 +126,11 @@ enum srv_initaddr {
     "bk_f_forced_id "             \
     "srv_f_forced_id "            \
     "srv_fqdn "                   \
-    "srv_port"
+    "srv_port "                   \
+    "srvrecord"
 
-#define SRV_STATE_FILE_MAX_FIELDS 19
-#define SRV_STATE_FILE_NB_FIELDS_VERSION_1 18
+#define SRV_STATE_FILE_MAX_FIELDS 20
+#define SRV_STATE_FILE_NB_FIELDS_VERSION_1 19
 #define SRV_STATE_LINE_MAXLEN 512
 
 /* server flags -- 32 bits */
@@ -280,6 +281,9 @@ struct server {
 			int allocated_size;
 		} * reused_sess;
 		char *ciphers;			/* cipher suite to use if non-null */
+#if (OPENSSL_VERSION_NUMBER >= 0x10101000L && !defined OPENSSL_IS_BORINGSSL && !defined LIBRESSL_VERSION_NUMBER)
+		char *ciphersuites;			/* TLS 1.3 cipher suite to use if non-null */
+#endif
 		int options;			/* ssl options */
 		int verify;			/* verify method (set of SSL_VERIFY_* flags) */
 		struct tls_version_filter methods;	/* ssl methods */
@@ -291,7 +295,7 @@ struct server {
 	} ssl_ctx;
 #endif
 	struct dns_srvrq *srvrq;		/* Pointer representing the DNS SRV requeest, if any */
-	__decl_hathreads(HA_SPINLOCK_T lock);
+	__decl_hathreads(HA_SPINLOCK_T lock);   /* may enclose the proxy's lock, must not be taken under */
 	struct {
 		const char *file;		/* file where the section appears */
 		struct eb32_node id;		/* place in the tree of used IDs */

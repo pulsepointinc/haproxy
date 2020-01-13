@@ -16,6 +16,7 @@
 
 #include <common/compat.h>
 #include <common/config.h>
+#include <common/hathreads.h>
 #include <common/ticks.h>
 #include <common/time.h>
 
@@ -55,18 +56,21 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 	for (updt_idx = 0; updt_idx < fd_nbupdt; updt_idx++) {
 		fd = fd_updt[updt_idx];
 
-		if (!fdtab[fd].owner)
-			continue;
-
 		HA_SPIN_LOCK(FD_LOCK, &fdtab[fd].lock);
-		fdtab[fd].updated = 0;
+		fdtab[fd].update_mask &= ~tid_bit;
+
+		if (!fdtab[fd].owner) {
+			activity[tid].poll_drop++;
+			HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
+			continue;
+		}
+
 		fdtab[fd].new = 0;
 
 		eo = fdtab[fd].state;
 		en = fd_compute_new_polled_status(eo);
 		fdtab[fd].state = en;
 		HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
-
 		if ((eo ^ en) & FD_EV_POLLED_RW) {
 			/* poll status changed, update the lists */
 			HA_SPIN_LOCK(POLL_LOCK, &poll_lock);
@@ -82,6 +86,47 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 			HA_SPIN_UNLOCK(POLL_LOCK, &poll_lock);
 		}
 	}
+	HA_SPIN_LOCK(FD_UPDATE_LOCK, &fd_updt_lock);
+	for (fd = update_list.first; fd != -1; fd = fdtab[fd].update.next) {
+		HA_SPIN_LOCK(FD_LOCK, &fdtab[fd].lock);
+		if (fdtab[fd].update_mask & tid_bit) {
+			/* Cheat a bit, as the state is global to all pollers
+			 * we don't need every thread ot take care of the
+			 * update.
+			 */
+			fdtab[fd].update_mask &= ~all_threads_mask;
+			done_update_polling(fd);
+		} else {
+			HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
+			continue;
+		}
+
+		fdtab[fd].new = 0;
+
+		eo = fdtab[fd].state;
+		en = fd_compute_new_polled_status(eo);
+		fdtab[fd].state = en;
+		HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
+		if ((eo ^ en) & FD_EV_POLLED_RW) {
+			/* poll status changed, update the lists */
+			HA_SPIN_LOCK(POLL_LOCK, &poll_lock);
+			if ((eo & ~en) & FD_EV_POLLED_R)
+				FD_CLR(fd, fd_evts[DIR_RD]);
+			else if ((en & ~eo) & FD_EV_POLLED_R)
+				FD_SET(fd, fd_evts[DIR_RD]);
+
+			if ((eo & ~en) & FD_EV_POLLED_W)
+				FD_CLR(fd, fd_evts[DIR_WR]);
+			else if ((en & ~eo) & FD_EV_POLLED_W)
+				FD_SET(fd, fd_evts[DIR_WR]);
+			HA_SPIN_UNLOCK(POLL_LOCK, &poll_lock);
+		}
+
+	}
+	HA_SPIN_UNLOCK(FD_UPDATE_LOCK, &fd_updt_lock);
+
+	thread_harmless_now();
+
 	fd_nbupdt = 0;
 
 	/* let's restore fdset state */
@@ -117,6 +162,8 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 		delta.tv_sec  = (delta_ms / 1000);
 		delta.tv_usec = (delta_ms % 1000) * 1000;
 	}
+	else
+		activity[tid].poll_exp++;
 
 	gettimeofday(&before_poll, NULL);
 	status = select(maxfd,
@@ -128,6 +175,8 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 	tv_update_date(delta_ms, status);
 	measure_idle();
 
+	thread_harmless_end();
+
 	if (status <= 0)
 		return;
 
@@ -138,11 +187,15 @@ REGPRM2 static void _do_poll(struct poller *p, int exp)
 		for (count = BITS_PER_INT, fd = fds * BITS_PER_INT; count && fd < maxfd; count--, fd++) {
 			unsigned int n = 0;
 
-			/* if we specify read first, the accepts and zero reads will be
-			 * seen first. Moreover, system buffers will be flushed faster.
-			 */
-			if (!fdtab[fd].owner || !(fdtab[fd].thread_mask & tid_bit))
+			if (!fdtab[fd].owner) {
+				activity[tid].poll_dead++;
 				continue;
+			}
+
+			if (!(fdtab[fd].thread_mask & tid_bit)) {
+				activity[tid].poll_skip++;
+				continue;
+			}
 
 			if (FD_ISSET(fd, tmp_evts[DIR_RD]))
 				n |= FD_POLL_IN;

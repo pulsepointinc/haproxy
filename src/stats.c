@@ -81,6 +81,7 @@ const char *info_field_names[INF_TOTAL_FIELDS] = {
 	[INF_NAME]                           = "Name",
 	[INF_VERSION]                        = "Version",
 	[INF_RELEASE_DATE]                   = "Release_date",
+	[INF_NBTHREAD]                       = "Nbthread",
 	[INF_NBPROC]                         = "Nbproc",
 	[INF_PROCESS_NUM]                    = "Process_num",
 	[INF_PID]                            = "Pid",
@@ -129,6 +130,9 @@ const char *info_field_names[INF_TOTAL_FIELDS] = {
 	[INF_IDLE_PCT]                       = "Idle_pct",
 	[INF_NODE]                           = "node",
 	[INF_DESCRIPTION]                    = "description",
+	[INF_STOPPING]                       = "Stopping",
+	[INF_JOBS]                           = "Jobs",
+	[INF_LISTENERS]                      = "Listeners",
 };
 
 const char *stat_field_names[ST_F_TOTAL_FIELDS] = {
@@ -2277,7 +2281,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 	              "<hr width=\"100%%\" class=\"hr\">\n"
 	              "<h3>&gt; General process information</h3>\n"
 	              "<table border=0><tr><td align=\"left\" nowrap width=\"1%%\">\n"
-	              "<p><b>pid = </b> %d (process #%d, nbproc = %d)<br>\n"
+	              "<p><b>pid = </b> %d (process #%d, nbproc = %d, nbthread = %d)<br>\n"
 	              "<b>uptime = </b> %dd %dh%02dm%02ds<br>\n"
 	              "<b>system limits:</b> memmax = %s%s; ulimit-n = %d<br>\n"
 	              "<b>maxsock = </b> %d; <b>maxconn = </b> %d; <b>maxpipes = </b> %d<br>\n"
@@ -2311,7 +2315,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 		      (uri->flags & ST_SHNODE) ? (uri->node ? uri->node : global.node) : "",
 	              (uri->flags & ST_SHDESC) ? ": " : "",
 		      (uri->flags & ST_SHDESC) ? (uri->desc ? uri->desc : global.desc) : "",
-	              pid, relative_pid, global.nbproc,
+	              pid, relative_pid, global.nbproc, global.nbthread,
 	              up / 86400, (up % 86400) / 3600,
 	              (up % 3600) / 60, (up % 60),
 	              global.rlimit_memmax ? ultoa(global.rlimit_memmax) : "unlimited",
@@ -2437,6 +2441,7 @@ static void stats_dump_html_info(struct stream_interface *si, struct uri_auth *u
 			              "Action not processed because of invalid parameters."
 			              "<ul>"
 			              "<li>The action is maybe unknown.</li>"
+				      "<li>Invalid key parameter (empty or too long).</li>"
 			              "<li>The backend name is probably unknown or ambiguous (duplicated names).</li>"
 			              "<li>Some server names are probably unknown or ambiguous (duplicated names in the backend).</li>"
 			              "</ul>"
@@ -2630,17 +2635,20 @@ static int stats_process_http_post(struct stream_interface *si)
 	int reql;
 
 	temp = get_trash_chunk();
-	if (temp->size < s->txn->req.body_len) {
-		/* too large request */
-		appctx->ctx.stats.st_code = STAT_STATUS_EXCD;
-		goto out;
-	}
 
+	/* we need more data */
+	if (s->txn->req.msg_state < HTTP_MSG_DONE) {
+		/* check if we can receive more */
+		if (buffer_total_space(s->req.buf) <= global.tune.maxrewrite) {
+			appctx->ctx.stats.st_code = STAT_STATUS_EXCD;
+			goto out;
+		}
+		goto wait;
+	}
 	reql = co_getblk(si_oc(si), temp->str, s->txn->req.body_len, s->txn->req.eoh + 2);
 	if (reql <= 0) {
-		/* we need more data */
-		appctx->ctx.stats.st_code = STAT_STATUS_NONE;
-		return 0;
+		appctx->ctx.stats.st_code = STAT_STATUS_EXCD;
+		goto out;
 	}
 
 	first_param = temp->str;
@@ -2669,7 +2677,7 @@ static int stats_process_http_post(struct stream_interface *si)
 				strncpy(key, cur_param + poffset, plen);
 				key[plen - 1] = '\0';
 			} else {
-				appctx->ctx.stats.st_code = STAT_STATUS_EXCD;
+				appctx->ctx.stats.st_code = STAT_STATUS_ERRP;
 				goto out;
 			}
 
@@ -2925,6 +2933,9 @@ static int stats_process_http_post(struct stream_interface *si)
 	}
  out:
 	return 1;
+ wait:
+	appctx->ctx.stats.st_code = STAT_STATUS_NONE;
+	return 0;
 }
 
 
@@ -3129,7 +3140,15 @@ static void http_stats_io_handler(struct appctx *appctx)
 		}
 	}
  out:
-	/* just to make gcc happy */ ;
+	/* we have left the request in the buffer for the case where we
+	 * process a POST, and this automatically re-enables activity on
+	 * read. It's better to indicate that we want to stop reading when
+	 * we're sending, so that we know there's at most one direction
+	 * deciding to wake the applet up. It saves it from looping when
+	 * emitting large blocks into small TCP windows.
+	 */
+	if (!channel_is_empty(res))
+		si_applet_stop_get(si);
 }
 
 /* Dump all fields from <info> into <out> using the "show info" format (name: value) */
@@ -3203,6 +3222,7 @@ int stats_fill_info(struct field *info, int len)
 	info[INF_VERSION]                        = mkf_str(FO_PRODUCT|FN_OUTPUT|FS_SERVICE, HAPROXY_VERSION);
 	info[INF_RELEASE_DATE]                   = mkf_str(FO_PRODUCT|FN_OUTPUT|FS_SERVICE, HAPROXY_DATE);
 
+	info[INF_NBTHREAD]                       = mkf_u32(FO_CONFIG|FS_SERVICE, global.nbthread);
 	info[INF_NBPROC]                         = mkf_u32(FO_CONFIG|FS_SERVICE, global.nbproc);
 	info[INF_PROCESS_NUM]                    = mkf_u32(FO_KEY, relative_pid);
 	info[INF_PID]                            = mkf_u32(FO_STATUS, pid);
@@ -3262,6 +3282,9 @@ int stats_fill_info(struct field *info, int len)
 	info[INF_NODE]                           = mkf_str(FO_CONFIG|FN_OUTPUT|FS_SERVICE, global.node);
 	if (global.desc)
 		info[INF_DESCRIPTION]            = mkf_str(FO_CONFIG|FN_OUTPUT|FS_SERVICE, global.desc);
+	info[INF_STOPPING]                       = mkf_u32(0, stopping);
+	info[INF_JOBS]                           = mkf_u32(0, jobs);
+	info[INF_LISTENERS]                      = mkf_u32(0, listeners);
 
 	return 1;
 }
@@ -3578,6 +3601,8 @@ static int cli_parse_clear_counters(char **args, struct appctx *appctx, void *pr
 	global.ssl_max = 0;
 	global.ssl_fe_keys_max = 0;
 	global.ssl_be_keys_max = 0;
+
+	memset(activity, 0, sizeof(activity));
 	return 1;
 }
 
@@ -3655,8 +3680,8 @@ static int cli_io_handler_dump_json_schema(struct appctx *appctx)
 /* register cli keywords */
 static struct cli_kw_list cli_kws = {{ },{
 	{ { "clear", "counters",  NULL }, "clear counters : clear max statistics counters (add 'all' for all counters)", cli_parse_clear_counters, NULL, NULL },
-	{ { "show", "info",  NULL }, "show info      : report information about the running process", cli_parse_show_info, cli_io_handler_dump_info, NULL },
-	{ { "show", "stat",  NULL }, "show stat      : report counters for each proxy and server", cli_parse_show_stat, cli_io_handler_dump_stat, NULL },
+	{ { "show", "info",  NULL }, "show info      : report information about the running process [json|typed]", cli_parse_show_info, cli_io_handler_dump_info, NULL },
+	{ { "show", "stat",  NULL }, "show stat      : report counters for each proxy and server [json|typed]", cli_parse_show_stat, cli_io_handler_dump_stat, NULL },
 	{ { "show", "schema",  "json", NULL }, "show schema json : report schema used for stats", NULL, cli_io_handler_dump_json_schema, NULL },
 	{{},}
 }};

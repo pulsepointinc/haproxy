@@ -942,9 +942,9 @@ struct task *hard_stop(struct task *t)
 	if (killed) {
 		ha_warning("Some tasks resisted to hard-stop, exiting now.\n");
 		send_log(NULL, LOG_WARNING, "Some tasks resisted to hard-stop, exiting now.\n");
-		/* Do some cleanup and explicitely quit */
-		deinit();
-		exit(0);
+		killed = 2;
+		t->expire = TICK_ETERNITY;
+		return t;
 	}
 
 	ha_warning("soft-stop running for too long, performing a hard-stop.\n");
@@ -1109,11 +1109,14 @@ void zombify_proxy(struct proxy *p)
  * to be called when going down in order to release the ports so that another
  * process may bind to them. It must also be called on disabled proxies at the
  * end of start-up. When all listeners are closed, the proxy is set to the
- * PR_STSTOPPED state.
+ * PR_STSTOPPED state. The function takes the proxy's lock so it's safe to
+ * call from multiple places.
  */
 void stop_proxy(struct proxy *p)
 {
 	struct listener *l;
+
+	HA_SPIN_LOCK(PROXY_LOCK, &p->lock);
 
 	list_for_each_entry(l, &p->conf.listeners, by_fe) {
 		unbind_listener(l);
@@ -1121,7 +1124,10 @@ void stop_proxy(struct proxy *p)
 			delete_listener(l);
 		}
 	}
+
 	p->state = PR_STSTOPPED;
+
+	HA_SPIN_UNLOCK(PROXY_LOCK, &p->lock);
 }
 
 /* This function resumes listening on the specified proxy. It scans all of its
@@ -1429,6 +1435,7 @@ static int dump_servers_state(struct stream_interface *si, struct chunk *buf)
 	char srv_addr[INET6_ADDRSTRLEN + 1];
 	time_t srv_time_since_last_change;
 	int bk_f_forced_id, srv_f_forced_id;
+	char *srvrecord;
 
 	/* we don't want to report any state if the backend is not enabled on this process */
 	if (px->bind_proc && !(px->bind_proc & pid_bit))
@@ -1450,23 +1457,31 @@ static int dump_servers_state(struct stream_interface *si, struct chunk *buf)
 				inet_ntop(srv->addr.ss_family, &((struct sockaddr_in6 *)&srv->addr)->sin6_addr,
 					  srv_addr, INET6_ADDRSTRLEN + 1);
 				break;
+			default:
+				memcpy(srv_addr, "-\0", 2);
+				break;
 		}
 		srv_time_since_last_change = now.tv_sec - srv->last_change;
 		bk_f_forced_id = px->options & PR_O_FORCED_ID ? 1 : 0;
 		srv_f_forced_id = srv->flags & SRV_F_FORCED_ID ? 1 : 0;
+
+		srvrecord = NULL;
+		if (srv->srvrq && srv->srvrq->name)
+			srvrecord = srv->srvrq->name;
 
 		chunk_appendf(buf,
 				"%d %s "
 				"%d %s %s "
 				"%d %d %d %d %ld "
 				"%d %d %d %d %d "
-				"%d %d %s %u"
+				"%d %d %s %u %s"
 				"\n",
 				px->uuid, px->id,
 				srv->puid, srv->id, srv_addr,
 				srv->cur_state, srv->cur_admin, srv->uweight, srv->iweight, (long int)srv_time_since_last_change,
 				srv->check.status, srv->check.result, srv->check.health, srv->check.state, srv->agent.state,
-				bk_f_forced_id, srv_f_forced_id, srv->hostname ? srv->hostname : "-", srv->svc_port);
+				bk_f_forced_id, srv_f_forced_id, srv->hostname ? srv->hostname : "-", srv->svc_port,
+				srvrecord ? srvrecord : "-");
 		if (ci_putchk(si_ic(si), &trash) == -1) {
 			si_applet_cant_put(si);
 			return 0;
@@ -1557,7 +1572,10 @@ static int cli_io_handler_show_backend(struct appctx *appctx)
 	return 1;
 }
 
-/* Parses the "enable dynamic-cookies backend" directive, it always returns 1 */
+/* Parses the "enable dynamic-cookies backend" directive, it always returns 1.
+ *
+ * Grabs the proxy lock and each server's lock.
+ */
 static int cli_parse_enable_dyncookie_backend(char **args, struct appctx *appctx, void *private)
 {
 	struct proxy *px;
@@ -1570,15 +1588,26 @@ static int cli_parse_enable_dyncookie_backend(char **args, struct appctx *appctx
 	if (!px)
 		return 1;
 
+	/* Note: this lock is to make sure this doesn't change while another
+	 * thread is in srv_set_dyncookie().
+	 */
+	HA_SPIN_LOCK(PROXY_LOCK, &px->lock);
 	px->ck_opts |= PR_CK_DYNAMIC;
+	HA_SPIN_UNLOCK(PROXY_LOCK, &px->lock);
 
-	for (s = px->srv; s != NULL; s = s->next)
+	for (s = px->srv; s != NULL; s = s->next) {
+		HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
 		srv_set_dyncookie(s);
+		HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
+	}
 
 	return 1;
 }
 
-/* Parses the "disable dynamic-cookies backend" directive, it always returns 1 */
+/* Parses the "disable dynamic-cookies backend" directive, it always returns 1.
+ *
+ * Grabs the proxy lock and each server's lock.
+ */
 static int cli_parse_disable_dyncookie_backend(char **args, struct appctx *appctx, void *private)
 {
 	struct proxy *px;
@@ -1591,19 +1620,29 @@ static int cli_parse_disable_dyncookie_backend(char **args, struct appctx *appct
 	if (!px)
 		return 1;
 
+	/* Note: this lock is to make sure this doesn't change while another
+	 * thread is in srv_set_dyncookie().
+	 */
+	HA_SPIN_LOCK(PROXY_LOCK, &px->lock);
 	px->ck_opts &= ~PR_CK_DYNAMIC;
+	HA_SPIN_UNLOCK(PROXY_LOCK, &px->lock);
 
 	for (s = px->srv; s != NULL; s = s->next) {
+		HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
 		if (!(s->flags & SRV_F_COOKIESET)) {
 			free(s->cookie);
 			s->cookie = NULL;
 		}
+		HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 	}
 
 	return 1;
 }
 
-/* Parses the "set dynamic-cookie-key backend" directive, it always returns 1 */
+/* Parses the "set dynamic-cookie-key backend" directive, it always returns 1.
+ *
+ * Grabs the proxy lock and each server's lock.
+ */
 static int cli_parse_set_dyncookie_key_backend(char **args, struct appctx *appctx, void *private)
 {
 	struct proxy *px;
@@ -1631,16 +1670,28 @@ static int cli_parse_set_dyncookie_key_backend(char **args, struct appctx *appct
 		appctx->st0 = CLI_ST_PRINT;
 		return 1;
 	}
+
+	/* Note: this lock is to make sure this doesn't change while another
+	 * thread is in srv_set_dyncookie().
+	 */
+	HA_SPIN_LOCK(PROXY_LOCK, &px->lock);
 	free(px->dyncookie_key);
 	px->dyncookie_key = newkey;
+	HA_SPIN_UNLOCK(PROXY_LOCK, &px->lock);
 
-	for (s = px->srv; s != NULL; s = s->next)
+	for (s = px->srv; s != NULL; s = s->next) {
+		HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
 		srv_set_dyncookie(s);
+		HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
+	}
 
 	return 1;
 }
 
-/* Parses the "set maxconn frontend" directive, it always returns 1 */
+/* Parses the "set maxconn frontend" directive, it always returns 1.
+ *
+ * Grabs the proxy lock.
+ */
 static int cli_parse_set_maxconn_frontend(char **args, struct appctx *appctx, void *private)
 {
 	struct proxy *px;
@@ -1672,6 +1723,8 @@ static int cli_parse_set_maxconn_frontend(char **args, struct appctx *appctx, vo
 	/* OK, the value is fine, so we assign it to the proxy and to all of
 	 * its listeners. The blocked ones will be dequeued.
 	 */
+	HA_SPIN_LOCK(PROXY_LOCK, &px->lock);
+
 	px->maxconn = v;
 	list_for_each_entry(l, &px->conf.listeners, by_fe) {
 		l->maxconn = v;
@@ -1682,10 +1735,15 @@ static int cli_parse_set_maxconn_frontend(char **args, struct appctx *appctx, vo
 	if (px->maxconn > px->feconn && !LIST_ISEMPTY(&px->listener_queue))
 		dequeue_all_listeners(&px->listener_queue);
 
+	HA_SPIN_UNLOCK(PROXY_LOCK, &px->lock);
+
 	return 1;
 }
 
-/* Parses the "shutdown frontend" directive, it always returns 1 */
+/* Parses the "shutdown frontend" directive, it always returns 1.
+ *
+ * Grabs the proxy lock.
+ */
 static int cli_parse_shutdown_frontend(char **args, struct appctx *appctx, void *private)
 {
 	struct proxy *px;
@@ -1708,14 +1766,19 @@ static int cli_parse_shutdown_frontend(char **args, struct appctx *appctx, void 
 		   px->id, px->fe_counters.cum_conn, px->be_counters.cum_conn);
 	send_log(px, LOG_WARNING, "Proxy %s stopped (FE: %lld conns, BE: %lld conns).\n",
 	         px->id, px->fe_counters.cum_conn, px->be_counters.cum_conn);
+
 	stop_proxy(px);
 	return 1;
 }
 
-/* Parses the "disable frontend" directive, it always returns 1 */
+/* Parses the "disable frontend" directive, it always returns 1.
+ *
+ * Grabs the proxy lock.
+ */
 static int cli_parse_disable_frontend(char **args, struct appctx *appctx, void *private)
 {
 	struct proxy *px;
+	int ret;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
@@ -1738,7 +1801,11 @@ static int cli_parse_disable_frontend(char **args, struct appctx *appctx, void *
 		return 1;
 	}
 
-	if (!pause_proxy(px)) {
+	HA_SPIN_LOCK(PROXY_LOCK, &px->lock);
+	ret = pause_proxy(px);
+	HA_SPIN_UNLOCK(PROXY_LOCK, &px->lock);
+
+	if (!ret) {
 		appctx->ctx.cli.severity = LOG_ERR;
 		appctx->ctx.cli.msg = "Failed to pause frontend, check logs for precise cause.\n";
 		appctx->st0 = CLI_ST_PRINT;
@@ -1747,10 +1814,14 @@ static int cli_parse_disable_frontend(char **args, struct appctx *appctx, void *
 	return 1;
 }
 
-/* Parses the "enable frontend" directive, it always returns 1 */
+/* Parses the "enable frontend" directive, it always returns 1.
+ *
+ * Grabs the proxy lock.
+ */
 static int cli_parse_enable_frontend(char **args, struct appctx *appctx, void *private)
 {
 	struct proxy *px;
+	int ret;
 
 	if (!cli_has_level(appctx, ACCESS_LVL_ADMIN))
 		return 1;
@@ -1773,7 +1844,11 @@ static int cli_parse_enable_frontend(char **args, struct appctx *appctx, void *p
 		return 1;
 	}
 
-	if (!resume_proxy(px)) {
+	HA_SPIN_LOCK(PROXY_LOCK, &px->lock);
+	ret = resume_proxy(px);
+	HA_SPIN_UNLOCK(PROXY_LOCK, &px->lock);
+
+	if (!ret) {
 		appctx->ctx.cli.severity = LOG_ERR;
 		appctx->ctx.cli.msg = "Failed to resume frontend, check logs for precise cause (port conflict?).\n";
 		appctx->st0 = CLI_ST_PRINT;

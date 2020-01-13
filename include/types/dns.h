@@ -115,9 +115,9 @@ struct dns_question {
 
 /* NOTE: big endian structure */
 struct dns_query_item {
-	char           name[DNS_MAX_NAME_SIZE]; /* query name */
-	unsigned short type;                    /* question type */
-	unsigned short class;                   /* query class */
+	char           name[DNS_MAX_NAME_SIZE+1]; /* query name */
+	unsigned short type;                      /* question type */
+	unsigned short class;                     /* query class */
 	struct list    list;
 };
 
@@ -138,17 +138,17 @@ struct dns_additional_record {
 /* NOTE: big endian structure */
 struct dns_answer_item {
 	/*For SRV type, name also includes service and protocol value */
-	char            name[DNS_MAX_NAME_SIZE];   /* answer name */
-	int16_t         type;                      /* question type */
-	int16_t         class;                     /* query class */
-	int32_t         ttl;                       /* response TTL */
-	int16_t         priority;                  /* SRV type priority */
-	int16_t         weight;                    /* SRV type weight */
-	int16_t         port;                      /* SRV type port */
-	int16_t         data_len;                  /* number of bytes in target below */
-	struct sockaddr address;                   /* IPv4 or IPv6, network format */
-	char            target[DNS_MAX_NAME_SIZE]; /* Response data: SRV or CNAME type target */
-	time_t          last_seen;                 /* When was the answer was last seen */
+	char            name[DNS_MAX_NAME_SIZE+1];   /* answer name */
+	int16_t         type;                        /* question type */
+	int16_t         class;                       /* query class */
+	int32_t         ttl;                         /* response TTL */
+	int16_t         priority;                    /* SRV type priority */
+	uint16_t        weight;                      /* SRV type weight */
+	uint16_t        port;                        /* SRV type port */
+	uint16_t        data_len;                    /* number of bytes in target below */
+	struct sockaddr address;                     /* IPv4 or IPv6, network format */
+	char            target[DNS_MAX_NAME_SIZE+1]; /* Response data: SRV or CNAME type target */
+	time_t          last_seen;                   /* When was the answer was last seen */
 	struct list     list;
 };
 
@@ -245,6 +245,8 @@ struct dns_options {
 		} mask;
 	} pref_net[SRV_MAX_PREF_NET];
 	int pref_net_nb; /* The number of registered prefered networks. */
+	int accept_duplicate_ip; /* flag to indicate whether the associated object can use an IP address
+				    already set to an other object of the same group */
 };
 
 /* Resolution structure associated to single server and used to manage name

@@ -176,6 +176,10 @@ list of options is :
     is compatible either with the foreground or daemon mode.  It is
     recommended to use this mode with multiprocess and systemd.
 
+  -Ws : master-worker mode with support of `notify` type of systemd service.
+    This option is only available when HAProxy was built with `USE_SYSTEMD`
+    build option enabled.
+
   -c : only performs a check of the configuration files and exits before trying
     to bind. The exit status is zero if everything is OK, or non-zero if an
     error is encountered.
@@ -1269,7 +1273,7 @@ example :
     # echo "show info;show stat;show table" | socat /var/run/haproxy stdio
 
 If a command needs to use a semi-colon or a backslash (eg: in a value), it
-must be preceeded by a backslash ('\').
+must be preceded by a backslash ('\').
 
 The interactive mode displays a prompt ('>') and waits for commands to be
 entered on the line, then processes them, and displays the prompt again to wait
@@ -1321,7 +1325,8 @@ add map <map> <key> <value>
 
 clear counters
   Clear the max values of the statistics counters in each proxy (frontend &
-  backend) and in each server. The accumulated counters are not affected. This
+  backend) and in each server. The accumulated counters are not affected. The
+  internal activity counters reported by "show activity" are also reset. This
   can be used to get clean counters after an incident, without having to
   restart nor to clear traffic counters. This command is restricted and can
   only be issued on sockets configured for levels "operator" or "admin".
@@ -1478,8 +1483,8 @@ enable agent <backend>/<server>
   level "admin".
 
 enable dynamic-cookie backend <backend>
-  Enable the generation of dynamic cookies fot the backend <backend>
-  A secret key must also be provided
+  Enable the generation of dynamic cookies for the backend <backend>.
+  A secret key must also be provided.
 
 enable frontend <frontend>
   Resume a frontend which was temporarily stopped. It is possible that some of
@@ -1629,7 +1634,7 @@ set rate-limit ssl-sessions global <value>
 
 set server <backend>/<server> addr <ip4 or ip6 address> [port <port>]
   Replace the current IP address of a server by the one provided.
-  Optionnaly, the port can be changed using the 'port' parameter.
+  Optionally, the port can be changed using the 'port' parameter.
   Note that changing the port also support switching from/to port mapping
   (notation with +X or -Y), only if a port is configured for the health check.
 
@@ -1670,7 +1675,8 @@ set server <backend>/<server> weight <weight>[%]
   equivalent of the "set weight" command below.
 
 set server <backend>/<server> fqdn <FQDN>
-  Change a server's FQDN to the value passed in argument.
+  Change a server's FQDN to the value passed in argument. This requires the
+  internal run-time DNS resolver to be configured and enabled for this server.
 
 set severity-output [ none | number | string ]
   Change the severity output format of the stats socket connected to for the
@@ -1755,7 +1761,7 @@ show cli sockets
      [::1]:9999 operator 2
 
 show cache
-  List the configurated caches and the objects stored in each cache tree.
+  List the configured caches and the objects stored in each cache tree.
 
   $ echo 'show cache' | socat stdio /tmp/sock1
   0x7f6ac6c5b03a: foobar (shctx:0x7f6ac6c5b000, available blocks:3918)
@@ -1860,6 +1866,18 @@ show fd [<fd>]
   this command without a good knowledge of the internals. It's worth noting
   that the output format may evolve over time so this output must not be parsed
   by tools designed to be durable.
+
+show activity
+  Reports some counters about internal events that will help developers and
+  more generally people who know haproxy well enough to narrow down the causes
+  of reports of abnormal behaviours. A typical example would be a properly
+  running process never sleeping and eating 100% of the CPU. The output fields
+  will be made of one line per metric, and per-thread counters on the same
+  line. These counters are 32-bit and will wrap during the process' life, which
+  is not a problem since calls to this command will typically be performed
+  twice. The fields are purposely not documented so that their exact meaning is
+  verified in the code where the counters are fed. These values are also reset
+  by the "clear counters" command.
 
 show info [typed|json]
   Dump info about haproxy status on current process. If "typed" is passed as an
@@ -2076,6 +2094,7 @@ show servers state [<backend>]
                                   configuration.
      srv_fqdn:                    Server FQDN.
      srv_port:                    Server port.
+     srvrecord:                   DNS SRV record associated to this SRV.
 
 show sess
   Dump all known sessions. Avoid doing this on slow connections as this can
@@ -2249,7 +2268,7 @@ show stat [{<iid>|<proxy>} <type> <sid>] [typed|json]
   $ echo "show stat json" | socat /var/run/haproxy.sock stdio | \
     python -m json.tool
 
-show stat resolvers [<resolvers section id>]
+show resolvers [<resolvers section id>]
   Dump statistics for the given resolvers section, or all resolvers sections
   if no section is supplied.
 

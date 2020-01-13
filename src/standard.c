@@ -629,7 +629,7 @@ const char *invalid_domainchar(const char *name) {
  * If everything is fine, NULL is returned.
  */
 const char *invalid_prefix_char(const char *name) {
-	return __invalid_char(name, isalpha);
+	return __invalid_char(name, isalnum);
 }
 
 /*
@@ -722,6 +722,7 @@ struct sockaddr_storage *str2ip2(const char *str, struct sockaddr_storage *sa, i
 #ifdef USE_GETADDRINFO
 	if (global.tune.options & GTUNE_USE_GAI) {
 		struct addrinfo hints, *result;
+		int success = 0;
 
 		memset(&result, 0, sizeof(result));
 		memset(&hints, 0, sizeof(hints));
@@ -733,23 +734,30 @@ struct sockaddr_storage *str2ip2(const char *str, struct sockaddr_storage *sa, i
 		if (getaddrinfo(str, NULL, &hints, &result) == 0) {
 			if (!sa->ss_family || sa->ss_family == AF_UNSPEC)
 				sa->ss_family = result->ai_family;
-			else if (sa->ss_family != result->ai_family)
+			else if (sa->ss_family != result->ai_family) {
+				freeaddrinfo(result);
 				goto fail;
+			}
 
 			switch (result->ai_family) {
 			case AF_INET:
 				memcpy((struct sockaddr_in *)sa, result->ai_addr, result->ai_addrlen);
 				set_host_port(sa, port);
-				return sa;
+				success = 1;
+				break;
 			case AF_INET6:
 				memcpy((struct sockaddr_in6 *)sa, result->ai_addr, result->ai_addrlen);
 				set_host_port(sa, port);
-				return sa;
+				success = 1;
+				break;
 			}
 		}
 
 		if (result)
 			freeaddrinfo(result);
+
+		if (success)
+			return sa;
 	}
 #endif
 	/* try to resolve an IPv4/IPv6 hostname */
@@ -3394,12 +3402,14 @@ char *memvprintf(char **out, const char *format, va_list orig_args)
 		return NULL;
 
 	do {
+		char buf1;
+
 		/* vsnprintf() will return the required length even when the
 		 * target buffer is NULL. We do this in a loop just in case
 		 * intermediate evaluations get wrong.
 		 */
 		va_copy(args, orig_args);
-		needed = vsnprintf(ret, allocated, format, args);
+		needed = vsnprintf(ret ? ret : &buf1, allocated, format, args);
 		va_end(args);
 		if (needed < allocated) {
 			/* Note: on Solaris 8, the first iteration always

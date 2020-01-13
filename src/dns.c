@@ -19,6 +19,7 @@
 
 #include <sys/types.h>
 
+#include <common/cfgparse.h>
 #include <common/errors.h>
 #include <common/time.h>
 #include <common/ticks.h>
@@ -136,10 +137,7 @@ static inline uint16_t dns_rnd16(void)
 
 static inline int dns_resolution_timeout(struct dns_resolution *res)
 {
-	switch (res->status) {
-		case RSLV_STATUS_VALID: return res->resolvers->hold.valid;
-		default:                return res->resolvers->timeout.resolve;
-	}
+	return res->resolvers->timeout.resolve;
 }
 
 /* Updates a resolvers' task timeout for next wake up and queue it */
@@ -350,11 +348,9 @@ void dns_trigger_resolution(struct dns_requester *req)
 	/* The resolution must not be triggered yet. Use the cached response, if
 	 * valid */
 	exp = tick_add(res->last_resolution, resolvers->hold.valid);
-	if (res->status == RSLV_STATUS_VALID &&
-	    tick_isset(res->last_resolution) && !tick_is_expired(exp, now_ms))
-		req->requester_cb(req, NULL);
-	else
-		dns_run_resolution(res);
+	if (resolvers->t && (res->status != RSLV_STATUS_VALID ||
+	    !tick_isset(res->last_resolution) || tick_is_expired(exp, now_ms)))
+		task_wakeup(resolvers->t, TASK_WOKEN_OTHER);
 }
 
 
@@ -393,7 +389,7 @@ static inline unsigned short dns_response_get_query_id(unsigned char *resp)
  */
 int dns_read_name(unsigned char *buffer, unsigned char *bufend,
 		  unsigned char *name, char *destination, int dest_len,
-		  int *offset)
+		  int *offset, unsigned int depth)
 {
 	int nb_bytes = 0, n = 0;
 	int label_len;
@@ -401,14 +397,23 @@ int dns_read_name(unsigned char *buffer, unsigned char *bufend,
 	char *dest = destination;
 
 	while (1) {
+		if (reader >= bufend)
+			goto err;
+
 		/* Name compression is in use */
 		if ((*reader & 0xc0) == 0xc0) {
+			if (reader + 1 >= bufend)
+				goto err;
+
 			/* Must point BEFORE current position */
 			if ((buffer + reader[1]) > reader)
 				goto err;
 
-			n = dns_read_name(buffer, bufend, buffer + reader[1],
-					  dest, dest_len - nb_bytes, offset);
+			if (depth++ > 100)
+				goto err;
+
+			n = dns_read_name(buffer, bufend, buffer + (*reader & 0x3f)*256 + reader[1],
+					  dest, dest_len - nb_bytes, offset, depth);
 			if (n == 0)
 				goto err;
 
@@ -522,10 +527,16 @@ static void dns_check_dns_response(struct dns_resolution *res)
 				if (srv->srvrq == srvrq && srv->svc_port == item->port &&
 				    item->data_len == srv->hostname_dn_len &&
 				    !memcmp(srv->hostname_dn, item->target, item->data_len)) {
-					if (srv->uweight != item->weight) {
+					int ha_weight;
+
+					/* Make sure weight is at least 1, so
+					 * that the server will be used.
+					 */
+					ha_weight = item->weight / 256 + 1;
+					if (srv->uweight != ha_weight) {
 						char weight[9];
 
-						snprintf(weight, sizeof(weight), "%d", item->weight);
+						snprintf(weight, sizeof(weight), "%d", ha_weight);
 						server_parse_weight_change_request(srv, weight);
 					}
 					HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
@@ -547,6 +558,7 @@ static void dns_check_dns_response(struct dns_resolution *res)
 			if (srv) {
 				const char *msg = NULL;
 				char weight[9];
+				int ha_weight;
 				char hostname[DNS_MAX_NAME_SIZE];
 
 				if (dns_dn_label_to_str(item->target, item->data_len+1,
@@ -563,7 +575,13 @@ static void dns_check_dns_response(struct dns_resolution *res)
 				if ((srv->check.state & CHK_ST_CONFIGURED) &&
 				    !(srv->flags & SRV_F_CHECKPORT))
 					srv->check.port = item->port;
-				snprintf(weight, sizeof(weight), "%d", item->weight);
+
+				/* Make sure weight is at least 1, so
+				 * that the server will be used.
+				 */
+				ha_weight = item->weight / 256 + 1;
+
+				snprintf(weight, sizeof(weight), "%d", ha_weight);
 				server_parse_weight_change_request(srv, weight);
 				HA_SPIN_UNLOCK(SERVER_LOCK, &srv->lock);
 			}
@@ -681,7 +699,7 @@ static int dns_validate_dns_response(unsigned char *resp, unsigned char *bufend,
 		 * one query per response and the first one can't be compressed
 		 * (using the 0x0c format) */
 		offset = 0;
-		len = dns_read_name(resp, bufend, reader, dns_query->name, DNS_MAX_NAME_SIZE, &offset);
+		len = dns_read_name(resp, bufend, reader, dns_query->name, DNS_MAX_NAME_SIZE, &offset, 0);
 
 		if (len == 0)
 			return DNS_RESP_INVALID;
@@ -718,7 +736,7 @@ static int dns_validate_dns_response(unsigned char *resp, unsigned char *bufend,
 			return (DNS_RESP_INVALID);
 
 		offset = 0;
-		len = dns_read_name(resp, bufend, reader, tmpname, DNS_MAX_NAME_SIZE, &offset);
+		len = dns_read_name(resp, bufend, reader, tmpname, DNS_MAX_NAME_SIZE, &offset, 0);
 
 		if (len == 0) {
 			pool_free(dns_answer_item_pool, dns_answer_record);
@@ -787,6 +805,11 @@ static int dns_validate_dns_response(unsigned char *resp, unsigned char *bufend,
 		/* Move forward 2 bytes for data len */
 		reader += 2;
 
+		if (reader + dns_answer_record->data_len > bufend) {
+			pool_free(dns_answer_item_pool, dns_answer_record);
+			return DNS_RESP_INVALID;
+		}
+
 		/* Analyzing record content */
 		switch (dns_answer_record->type) {
 			case DNS_RTYPE_A:
@@ -815,7 +838,7 @@ static int dns_validate_dns_response(unsigned char *resp, unsigned char *bufend,
 				}
 
 				offset = 0;
-				len = dns_read_name(resp, bufend, reader, tmpname, DNS_MAX_NAME_SIZE, &offset);
+				len = dns_read_name(resp, bufend, reader, tmpname, DNS_MAX_NAME_SIZE, &offset, 0);
 				if (len == 0) {
 					pool_free(dns_answer_item_pool, dns_answer_record);
 					return DNS_RESP_INVALID;
@@ -845,7 +868,7 @@ static int dns_validate_dns_response(unsigned char *resp, unsigned char *bufend,
 				dns_answer_record->port = read_n16(reader);
 				reader += sizeof(uint16_t);
 				offset = 0;
-				len = dns_read_name(resp, bufend, reader, tmpname, DNS_MAX_NAME_SIZE, &offset);
+				len = dns_read_name(resp, bufend, reader, tmpname, DNS_MAX_NAME_SIZE, &offset, 0);
 				if (len == 0) {
 					pool_free(dns_answer_item_pool, dns_answer_record);
 					return DNS_RESP_INVALID;
@@ -954,8 +977,10 @@ int dns_get_ip_from_response(struct dns_response_packet *dns_p,
 	int currentip_sel;
 	int j;
 	int score, max_score;
+	int allowed_duplicated_ip;
 
 	family_priority   = dns_opts->family_prio;
+	allowed_duplicated_ip = dns_opts->accept_duplicate_ip;
 	*newip = newip4   = newip6 = NULL;
 	currentip_found   = 0;
 	*newip_sin_family = AF_UNSPEC;
@@ -1016,10 +1041,15 @@ int dns_get_ip_from_response(struct dns_response_packet *dns_p,
 		}
 
 		/* Check if the IP found in the record is already affected to a
-		 * member of a group.  If yes, the score should be incremented
+		 * member of a group.  If not, the score should be incremented
 		 * by 2. */
-		if (owner && snr_check_ip_callback(owner, ip, &ip_type))
-			continue;
+		if (owner && snr_check_ip_callback(owner, ip, &ip_type)) {
+			if (!allowed_duplicated_ip) {
+				continue;
+			}
+		} else {
+			score += 2;
+		}
 
 		/* Check for current ip matching. */
 		if (ip_type == currentip_sin_family &&
@@ -1722,12 +1752,6 @@ static struct task *dns_process_resolvers(struct task *t)
 			dns_reset_resolution(res);
 			LIST_DEL(&res->list);
 			LIST_ADDQ(&resolvers->resolutions.wait, &res->list);
-
-			/* This might be triggered by too big UDP packets
-			 * dropped somewhere on the network, so lowering the
-			 * accepted_payload_size announced */
-			if (resolvers->accepted_payload_size > 1280)
-				resolvers->accepted_payload_size = 1280;
 		}
 		else {
 			/* Otherwise resend the DNS query and requeue the resolution */
@@ -2048,7 +2072,7 @@ static void __dns_init(void)
 	dns_answer_item_pool = create_pool("dns_answer_item", sizeof(struct dns_answer_item), MEM_F_SHARED);
 	dns_resolution_pool  = create_pool("dns_resolution",  sizeof(struct dns_resolution),  MEM_F_SHARED);
 
-	hap_register_post_check(dns_finalize_config);
+	cfg_register_postparser("dns runtime resolver", dns_finalize_config);
 	hap_register_post_deinit(dns_deinit);
 
 	cli_register_kw(&cli_kws);

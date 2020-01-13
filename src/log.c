@@ -212,11 +212,13 @@ char default_rfc5424_sd_log_format[] = "- ";
  * update_log_hdr().
  */
 THREAD_LOCAL char *logheader = NULL;
+THREAD_LOCAL char *logheader_end = NULL;
 
 /* This is a global syslog header for messages in RFC5424 format. It is
  * updated by update_log_hdr_rfc5424().
  */
 THREAD_LOCAL char *logheader_rfc5424 = NULL;
+THREAD_LOCAL char *logheader_rfc5424_end = NULL;
 
 /* This is a global syslog message buffer, common to all outgoing
  * messages. It contains only the data part.
@@ -230,7 +232,7 @@ THREAD_LOCAL char *logline_rfc5424 = NULL;
 
 /* A global buffer used to store all startup alerts/warnings. It will then be
  * retrieve on the CLI. */
-static THREAD_LOCAL char *startup_logs = NULL;
+static char *startup_logs = NULL;
 
 struct logformat_var_args {
 	char *name;
@@ -986,11 +988,10 @@ char *lf_port(char *dst, struct sockaddr *sockaddr, size_t size, struct logforma
 static char *update_log_hdr(const time_t time)
 {
 	static THREAD_LOCAL long tvsec;
-	static THREAD_LOCAL char *dataptr = NULL; /* backup of last end of header, NULL first time */
 	static THREAD_LOCAL struct chunk host = { NULL, 0, 0 };
 	static THREAD_LOCAL int sep = 0;
 
-	if (unlikely(time != tvsec || dataptr == NULL)) {
+	if (unlikely(time != tvsec || logheader_end == NULL)) {
 		/* this string is rebuild only once a second */
 		struct tm tm;
 		int hdr_len;
@@ -1016,12 +1017,12 @@ static char *update_log_hdr(const time_t time)
 		if (hdr_len < 0 || hdr_len > global.max_syslog_len)
 			hdr_len = global.max_syslog_len;
 
-		dataptr = logheader + hdr_len;
+		logheader_end = logheader + hdr_len;
 	}
 
-	dataptr[0] = 0; // ensure we get rid of any previous attempt
+	logheader_end[0] = 0; // ensure we get rid of any previous attempt
 
-	return dataptr;
+	return logheader_end;
 }
 
 /* Re-generate time-based part of the syslog header in RFC5424 format at
@@ -1031,10 +1032,9 @@ static char *update_log_hdr(const time_t time)
 static char *update_log_hdr_rfc5424(const time_t time)
 {
 	static THREAD_LOCAL long tvsec;
-	static THREAD_LOCAL char *dataptr = NULL; /* backup of last end of header, NULL first time */
 	const char *gmt_offset;
 
-	if (unlikely(time != tvsec || dataptr == NULL)) {
+	if (unlikely(time != tvsec || logheader_rfc5424_end == NULL)) {
 		/* this string is rebuild only once a second */
 		struct tm tm;
 		int hdr_len;
@@ -1056,12 +1056,12 @@ static char *update_log_hdr_rfc5424(const time_t time)
 		if (hdr_len < 0 || hdr_len > global.max_syslog_len)
 			hdr_len = global.max_syslog_len;
 
-		dataptr = logheader_rfc5424 + hdr_len;
+		logheader_rfc5424_end = logheader_rfc5424 + hdr_len;
 	}
 
-	dataptr[0] = 0; // ensure we get rid of any previous attempt
+	logheader_rfc5424_end[0] = 0; // ensure we get rid of any previous attempt
 
-	return dataptr;
+	return logheader_rfc5424_end;
 }
 
 /*
@@ -1168,14 +1168,20 @@ void __send_log(struct proxy *p, int level, char *message, size_t size, char *sd
 			int proto = logsrv->addr.ss_family == AF_UNIX ? 0 : IPPROTO_UDP;
 
 			if ((*plogfd = socket(logsrv->addr.ss_family, SOCK_DGRAM, proto)) < 0) {
-				ha_alert("socket for logger #%d failed: %s (errno=%d)\n",
-					 nblogger, strerror(errno), errno);
+				static char once;
+
+				if (!once) {
+					once = 1; /* note: no need for atomic ops here */
+					ha_alert("socket for logger #%d failed: %s (errno=%d)\n",
+					         nblogger, strerror(errno), errno);
+				}
 				continue;
 			}
 			/* we don't want to receive anything on this socket */
 			setsockopt(*plogfd, SOL_SOCKET, SO_RCVBUF, &zero, sizeof(zero));
 			/* does nothing under Linux, maybe needed for others */
 			shutdown(*plogfd, SHUT_RD);
+			fcntl(*plogfd, F_SETFD, fcntl(*plogfd, F_GETFD, FD_CLOEXEC) | FD_CLOEXEC);
 		}
 
 		switch (logsrv->format) {
@@ -1296,8 +1302,13 @@ send:
 		sent = sendmsg(*plogfd, &msghdr, MSG_DONTWAIT | MSG_NOSIGNAL);
 
 		if (sent < 0) {
-			ha_alert("sendmsg logger #%d failed: %s (errno=%d)\n",
-				 nblogger, strerror(errno), errno);
+			static char once;
+
+			if (!once) {
+				once = 1; /* note: no need for atomic ops here */
+				ha_alert("sendmsg logger #%d failed: %s (errno=%d)\n",
+				         nblogger, strerror(errno), errno);
+			}
 		}
 	}
 }
@@ -1358,7 +1369,9 @@ static void deinit_log_buffers_per_thread()
 int init_log_buffers()
 {
 	logheader = my_realloc2(logheader, global.max_syslog_len + 1);
+	logheader_end = NULL;
 	logheader_rfc5424 = my_realloc2(logheader_rfc5424, global.max_syslog_len + 1);
+	logheader_rfc5424_end = NULL;
 	logline = my_realloc2(logline, global.max_syslog_len + 1);
 	logline_rfc5424 = my_realloc2(logline_rfc5424, global.max_syslog_len + 1);
 	if (!logheader || !logline_rfc5424 || !logline || !logline_rfc5424)
@@ -1369,11 +1382,15 @@ int init_log_buffers()
 /* Deinitialize log buffers used for syslog messages */
 void deinit_log_buffers()
 {
+	void *tmp_startup_logs;
+
 	free(logheader);
 	free(logheader_rfc5424);
 	free(logline);
 	free(logline_rfc5424);
-	free(startup_logs);
+	tmp_startup_logs = HA_ATOMIC_XCHG(&startup_logs, NULL);
+	free(tmp_startup_logs);
+
 	logheader         = NULL;
 	logheader_rfc5424 = NULL;
 	logline           = NULL;
@@ -1636,7 +1653,6 @@ int build_logline(struct stream *s, char *dst, size_t maxsize, struct list *list
 				break;
 
 			case LOG_FMT_TS: // %Ts
-				get_gmtime(s->logs.accept_date.tv_sec, &tm);
 				if (tmp->options & LOG_OPT_HEXA) {
 					iret = snprintf(tmplog, dst + maxsize - tmplog, "%04X", (unsigned int)s->logs.accept_date.tv_sec);
 					if (iret < 0 || iret > dst + maxsize - tmplog)

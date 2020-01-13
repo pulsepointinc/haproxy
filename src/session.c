@@ -52,10 +52,7 @@ struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type
 		memset(sess->stkctr, 0, sizeof(sess->stkctr));
 		vars_init(&sess->vars, SCOPE_SESS);
 		sess->task = NULL;
-		HA_ATOMIC_UPDATE_MAX(&fe->fe_counters.conn_max,
-				     HA_ATOMIC_ADD(&fe->feconn, 1));
-		if (li)
-			proxy_inc_fe_conn_ctr(li, fe);
+		sess->t_handshake = -1; /* handshake not done yet */
 		HA_ATOMIC_ADD(&totalconn, 1);
 		HA_ATOMIC_ADD(&jobs, 1);
 	}
@@ -64,7 +61,6 @@ struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type
 
 void session_free(struct session *sess)
 {
-	HA_ATOMIC_SUB(&sess->fe->feconn, 1);
 	if (sess->listener)
 		listener_release(sess->listener);
 	session_store_counters(sess);
@@ -264,19 +260,21 @@ int session_accept_fd(struct listener *l, int cfd, struct sockaddr_storage *addr
 	}
 
 	/* OK let's complete stream initialization since there is no handshake */
-	cli_conn->flags |= CO_FL_CONNECTED;
-
 	if (conn_complete_session(cli_conn) >= 0)
 		return 1;
 
 	/* error unrolling */
  out_free_sess:
+	 /* prevent call to listener_release during session_free. It will be
+	  * done below, for all errors. */
+	sess->listener = NULL;
 	session_free(sess);
  out_free_conn:
 	conn_stop_tracking(cli_conn);
 	conn_xprt_close(cli_conn);
 	conn_free(cli_conn);
  out_close:
+	listener_release(l);
 	if (ret < 0 && l->bind_conf->xprt == xprt_get(XPRT_RAW) && p->mode == PR_MODE_HTTP) {
 		/* critical error, no more memory, try to emit a 500 response */
 		struct chunk *err_msg = &p->errmsg[HTTP_ERR_500];
@@ -400,7 +398,13 @@ static int conn_complete_session(struct connection *conn)
 {
 	struct session *sess = conn->owner;
 
+	sess->t_handshake = tv_ms_elapsed(&sess->tv_accept, &now);
+
 	conn_clear_xprt_done_cb(conn);
+
+	/* Verify if the connection just established. */
+	if (unlikely(!(conn->flags & (CO_FL_WAIT_L4_CONN | CO_FL_WAIT_L6_CONN | CO_FL_CONNECTED))))
+		conn->flags |= CO_FL_CONNECTED;
 
 	if (conn->flags & CO_FL_ERROR)
 		goto fail;

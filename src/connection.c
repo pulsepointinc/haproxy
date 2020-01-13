@@ -63,8 +63,10 @@ void conn_fd_handler(int fd)
 	struct connection *conn = fdtab[fd].owner;
 	unsigned int flags;
 
-	if (unlikely(!conn))
+	if (unlikely(!conn)) {
+		activity[tid].conn_dead++;
 		return;
+	}
 
 	conn_refresh_polling_flags(conn);
 	conn->flags |= CO_FL_WILL_UPDATE;
@@ -402,7 +404,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		goto fail;
 
 	if (!fd_recv_ready(conn->handle.fd))
-		return 0;
+		goto not_ready;
 
 	do {
 		trash.len = recv(conn->handle.fd, trash.str, trash.size, MSG_PEEK);
@@ -411,7 +413,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 				continue;
 			if (errno == EAGAIN) {
 				fd_cant_recv(conn->handle.fd);
-				return 0;
+				goto not_ready;
 			}
 			goto recv_abort;
 		}
@@ -651,7 +653,13 @@ int conn_recv_proxy(struct connection *conn, int flag)
 
 	conn->flags &= ~flag;
 	conn->flags |= CO_FL_RCVD_PROXY;
+	__conn_sock_stop_recv(conn);
 	return 1;
+
+ not_ready:
+	__conn_sock_want_recv(conn);
+	__conn_sock_stop_send(conn);
+	return 0;
 
  missing:
 	/* Missing data. Since we're using MSG_PEEK, we can only poll again if
@@ -678,14 +686,8 @@ int conn_recv_proxy(struct connection *conn, int flag)
 }
 
 /* This handshake handler waits a NetScaler Client IP insertion header
- * at the beginning of the raw data stream. The header looks like this:
- *
- *   4 bytes:   CIP magic number
- *   4 bytes:   Header length
- *   20+ bytes: Header of the last IP packet sent by the client during
- *              TCP handshake.
- *   20+ bytes: Header of the last TCP packet sent by the client during
- *              TCP handshake.
+ * at the beginning of the raw data stream. The header format is
+ * described in doc/netscaler-client-ip-insertion-protocol.txt
  *
  * This line MUST be at the beginning of the buffer and MUST NOT be
  * fragmented.
@@ -702,9 +704,8 @@ int conn_recv_proxy(struct connection *conn, int flag)
 int conn_recv_netscaler_cip(struct connection *conn, int flag)
 {
 	char *line;
-	uint32_t cip_magic;
-	uint32_t cip_len;
-	uint8_t ip_v;
+	uint32_t hdr_len;
+	uint8_t ip_ver;
 
 	/* we might have been called just after an asynchronous shutr */
 	if (conn->flags & CO_FL_SOCK_RD_SH)
@@ -714,7 +715,7 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 		goto fail;
 
 	if (!fd_recv_ready(conn->handle.fd))
-		return 0;
+		goto not_ready;
 
 	do {
 		trash.len = recv(conn->handle.fd, trash.str, trash.size, MSG_PEEK);
@@ -723,7 +724,7 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 				continue;
 			if (errno == EAGAIN) {
 				fd_cant_recv(conn->handle.fd);
-				return 0;
+				goto not_ready;
 			}
 			goto recv_abort;
 		}
@@ -736,48 +737,57 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 	}
 
 	/* Fail if buffer length is not large enough to contain
-	 * CIP magic, CIP length */
-	if (trash.len < 8)
+	 * CIP magic, header length or
+	 * CIP magic, CIP length, CIP type, header length */
+	if (trash.len < 12)
 		goto missing;
 
 	line = trash.str;
 
-	cip_magic = ntohl(*(uint32_t *)line);
-	cip_len = ntohl(*(uint32_t *)(line+4));
-
 	/* Decode a possible NetScaler Client IP request, fail early if
 	 * it does not match */
-	if (cip_magic != objt_listener(conn->target)->bind_conf->ns_cip_magic)
+	if (ntohl(*(uint32_t *)line) != objt_listener(conn->target)->bind_conf->ns_cip_magic)
 		goto bad_magic;
 
+	/* Legacy CIP protocol */
+	if ((trash.str[8] & 0xD0) == 0x40) {
+		hdr_len = ntohl(*(uint32_t *)(line+4));
+		line += 8;
+	}
+	/* Standard CIP protocol */
+	else if (trash.str[8] == 0x00) {
+		hdr_len = ntohs(*(uint32_t *)(line+10));
+		line += 12;
+	}
+	/* Unknown CIP protocol */
+	else {
+		conn->err_code = CO_ER_CIP_BAD_PROTO;
+		goto fail;
+	}
+
 	/* Fail if buffer length is not large enough to contain
-	 * CIP magic, CIP length, minimal IP header */
-	if (trash.len < 28)
+	 * a minimal IP header */
+	if (trash.len < 20)
 		goto missing;
 
-	line += 8;
-
 	/* Get IP version from the first four bits */
-	ip_v = (*line & 0xf0) >> 4;
+	ip_ver = (*line & 0xf0) >> 4;
 
-	if (ip_v == 4) {
+	if (ip_ver == 4) {
 		struct ip *hdr_ip4;
 		struct my_tcphdr *hdr_tcp;
 
 		hdr_ip4 = (struct ip *)line;
 
-		if (trash.len < (8 + ntohs(hdr_ip4->ip_len))) {
+		if (trash.len < 40 || trash.len < hdr_len) {
 			/* Fail if buffer length is not large enough to contain
-			 * CIP magic, CIP length, IPv4 header */
+			 * IPv4 header, TCP header */
 			goto missing;
-		} else if (hdr_ip4->ip_p != IPPROTO_TCP) {
+		}
+		else if (hdr_ip4->ip_p != IPPROTO_TCP) {
 			/* The protocol does not include a TCP header */
 			conn->err_code = CO_ER_CIP_BAD_PROTO;
 			goto fail;
-		} else if (trash.len < (28 + ntohs(hdr_ip4->ip_len))) {
-			/* Fail if buffer length is not large enough to contain
-			 * CIP magic, CIP length, IPv4 header, TCP header */
-			goto missing;
 		}
 
 		hdr_tcp = (struct my_tcphdr *)(line + (hdr_ip4->ip_hl * 4));
@@ -793,24 +803,21 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 
 		conn->flags |= CO_FL_ADDR_FROM_SET | CO_FL_ADDR_TO_SET;
 	}
-	else if (ip_v == 6) {
+	else if (ip_ver == 6) {
 		struct ip6_hdr *hdr_ip6;
 		struct my_tcphdr *hdr_tcp;
 
 		hdr_ip6 = (struct ip6_hdr *)line;
 
-		if (trash.len < 28) {
+		if (trash.len < 60 || trash.len < hdr_len) {
 			/* Fail if buffer length is not large enough to contain
-			 * CIP magic, CIP length, IPv6 header */
+			 * IPv6 header, TCP header */
 			goto missing;
-		} else if (hdr_ip6->ip6_nxt != IPPROTO_TCP) {
+		}
+		else if (hdr_ip6->ip6_nxt != IPPROTO_TCP) {
 			/* The protocol does not include a TCP header */
 			conn->err_code = CO_ER_CIP_BAD_PROTO;
 			goto fail;
-		} else if (trash.len < 48) {
-			/* Fail if buffer length is not large enough to contain
-			 * CIP magic, CIP length, IPv6 header, TCP header */
-			goto missing;
 		}
 
 		hdr_tcp = (struct my_tcphdr *)(line + sizeof(struct ip6_hdr));
@@ -832,7 +839,7 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 		goto fail;
 	}
 
-	line += cip_len;
+	line += hdr_len;
 	trash.len = line - trash.str;
 
 	/* remove the NetScaler Client IP header from the request. For this
@@ -848,7 +855,13 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 	} while (0);
 
 	conn->flags &= ~flag;
+	__conn_sock_stop_recv(conn);
 	return 1;
+
+ not_ready:
+	__conn_sock_want_recv(conn);
+	__conn_sock_stop_send(conn);
+	return 0;
 
  missing:
 	/* Missing data. Since we're using MSG_PEEK, we can only poll again if
@@ -873,6 +886,7 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 	return 0;
 }
 
+/* Note: <remote> is explicitly allowed to be NULL */
 int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connection *remote)
 {
 	int ret = 0;
@@ -900,73 +914,71 @@ int make_proxy_line(char *buf, int buf_len, struct server *srv, struct connectio
 int make_proxy_line_v1(char *buf, int buf_len, struct sockaddr_storage *src, struct sockaddr_storage *dst)
 {
 	int ret = 0;
+	char * protocol;
+	char src_str[MAX(INET_ADDRSTRLEN, INET6_ADDRSTRLEN)];
+	char dst_str[MAX(INET_ADDRSTRLEN, INET6_ADDRSTRLEN)];
+	in_port_t src_port;
+	in_port_t dst_port;
 
-	if (src && dst && src->ss_family == dst->ss_family && src->ss_family == AF_INET) {
-		ret = snprintf(buf + ret, buf_len - ret, "PROXY TCP4 ");
-		if (ret >= buf_len)
-			return 0;
-
-		/* IPv4 src */
-		if (!inet_ntop(src->ss_family, &((struct sockaddr_in *)src)->sin_addr, buf + ret, buf_len - ret))
-			return 0;
-
-		ret += strlen(buf + ret);
-		if (ret >= buf_len)
-			return 0;
-
-		buf[ret++] = ' ';
-
-		/* IPv4 dst */
-		if (!inet_ntop(dst->ss_family, &((struct sockaddr_in *)dst)->sin_addr, buf + ret, buf_len - ret))
-			return 0;
-
-		ret += strlen(buf + ret);
-		if (ret >= buf_len)
-			return 0;
-
-		/* source and destination ports */
-		ret += snprintf(buf + ret, buf_len - ret, " %u %u\r\n",
-				ntohs(((struct sockaddr_in *)src)->sin_port),
-				ntohs(((struct sockaddr_in *)dst)->sin_port));
-		if (ret >= buf_len)
-			return 0;
-	}
-	else if (src && dst && src->ss_family == dst->ss_family && src->ss_family == AF_INET6) {
-		ret = snprintf(buf + ret, buf_len - ret, "PROXY TCP6 ");
-		if (ret >= buf_len)
-			return 0;
-
-		/* IPv6 src */
-		if (!inet_ntop(src->ss_family, &((struct sockaddr_in6 *)src)->sin6_addr, buf + ret, buf_len - ret))
-			return 0;
-
-		ret += strlen(buf + ret);
-		if (ret >= buf_len)
-			return 0;
-
-		buf[ret++] = ' ';
-
-		/* IPv6 dst */
-		if (!inet_ntop(dst->ss_family, &((struct sockaddr_in6 *)dst)->sin6_addr, buf + ret, buf_len - ret))
-			return 0;
-
-		ret += strlen(buf + ret);
-		if (ret >= buf_len)
-			return 0;
-
-		/* source and destination ports */
-		ret += snprintf(buf + ret, buf_len - ret, " %u %u\r\n",
-				ntohs(((struct sockaddr_in6 *)src)->sin6_port),
-				ntohs(((struct sockaddr_in6 *)dst)->sin6_port));
-		if (ret >= buf_len)
-			return 0;
-	}
-	else {
+	if (   !src
+	    || !dst
+	    || (src->ss_family != AF_INET && src->ss_family != AF_INET6)
+	    || (dst->ss_family != AF_INET && dst->ss_family != AF_INET6)) {
 		/* unknown family combination */
 		ret = snprintf(buf, buf_len, "PROXY UNKNOWN\r\n");
 		if (ret >= buf_len)
 			return 0;
+
+		return ret;
 	}
+
+	/* IPv4 for both src and dst */
+	if (src->ss_family == AF_INET && dst->ss_family == AF_INET) {
+		protocol = "TCP4";
+		if (!inet_ntop(AF_INET, &((struct sockaddr_in *)src)->sin_addr, src_str, sizeof(src_str)))
+			return 0;
+		src_port = ((struct sockaddr_in *)src)->sin_port;
+		if (!inet_ntop(AF_INET, &((struct sockaddr_in *)dst)->sin_addr, dst_str, sizeof(dst_str)))
+			return 0;
+		dst_port = ((struct sockaddr_in *)dst)->sin_port;
+	}
+	/* IPv6 for at least one of src and dst */
+	else {
+		struct in6_addr tmp;
+
+		protocol = "TCP6";
+
+		if (src->ss_family == AF_INET) {
+			/* Convert src to IPv6 */
+			v4tov6(&tmp, &((struct sockaddr_in *)src)->sin_addr);
+			src_port = ((struct sockaddr_in *)src)->sin_port;
+		}
+		else {
+			tmp = ((struct sockaddr_in6 *)src)->sin6_addr;
+			src_port = ((struct sockaddr_in6 *)src)->sin6_port;
+		}
+
+		if (!inet_ntop(AF_INET6, &tmp, src_str, sizeof(src_str)))
+			return 0;
+
+		if (dst->ss_family == AF_INET) {
+			/* Convert dst to IPv6 */
+			v4tov6(&tmp, &((struct sockaddr_in *)dst)->sin_addr);
+			dst_port = ((struct sockaddr_in *)dst)->sin_port;
+		}
+		else {
+			tmp = ((struct sockaddr_in6 *)dst)->sin6_addr;
+			dst_port = ((struct sockaddr_in6 *)dst)->sin6_port;
+		}
+
+		if (!inet_ntop(AF_INET6, &tmp, dst_str, sizeof(dst_str)))
+			return 0;
+	}
+
+	ret = snprintf(buf, buf_len, "PROXY %s %s %s %u %u\r\n", protocol, src_str, dst_str, ntohs(src_port), ntohs(dst_port));
+	if (ret >= buf_len)
+		return 0;
+
 	return ret;
 }
 
@@ -986,6 +998,7 @@ static int make_tlv(char *dest, int dest_len, char type, uint16_t length, const 
 	return length + sizeof(*tlv);
 }
 
+/* Note: <remote> is explicitly allowed to be NULL */
 int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connection *remote)
 {
 	const char pp2_signature[] = PP2_SIGNATURE;
@@ -1006,37 +1019,62 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 		dst = &remote->addr.to;
 	}
 
-	if (src && dst && src->ss_family == dst->ss_family && src->ss_family == AF_INET) {
-		if (buf_len < PP2_HDR_LEN_INET)
-			return 0;
-		hdr->ver_cmd = PP2_VERSION | PP2_CMD_PROXY;
-		hdr->fam = PP2_FAM_INET | PP2_TRANS_STREAM;
-		hdr->addr.ip4.src_addr = ((struct sockaddr_in *)src)->sin_addr.s_addr;
-		hdr->addr.ip4.dst_addr = ((struct sockaddr_in *)dst)->sin_addr.s_addr;
-		hdr->addr.ip4.src_port = ((struct sockaddr_in *)src)->sin_port;
-		hdr->addr.ip4.dst_port = ((struct sockaddr_in *)dst)->sin_port;
-		ret = PP2_HDR_LEN_INET;
-	}
-	else if (src && dst && src->ss_family == dst->ss_family && src->ss_family == AF_INET6) {
-		if (buf_len < PP2_HDR_LEN_INET6)
-			return 0;
-		hdr->ver_cmd = PP2_VERSION | PP2_CMD_PROXY;
-		hdr->fam = PP2_FAM_INET6 | PP2_TRANS_STREAM;
-		memcpy(hdr->addr.ip6.src_addr, &((struct sockaddr_in6 *)src)->sin6_addr, 16);
-		memcpy(hdr->addr.ip6.dst_addr, &((struct sockaddr_in6 *)dst)->sin6_addr, 16);
-		hdr->addr.ip6.src_port = ((struct sockaddr_in6 *)src)->sin6_port;
-		hdr->addr.ip6.dst_port = ((struct sockaddr_in6 *)dst)->sin6_port;
-		ret = PP2_HDR_LEN_INET6;
-	}
-	else {
+	/* At least one of src or dst is not of AF_INET or AF_INET6 */
+	if (  !src
+	   || !dst
+	   || (src->ss_family != AF_INET && src->ss_family != AF_INET6)
+	   || (dst->ss_family != AF_INET && dst->ss_family != AF_INET6)) {
 		if (buf_len < PP2_HDR_LEN_UNSPEC)
 			return 0;
 		hdr->ver_cmd = PP2_VERSION | PP2_CMD_LOCAL;
 		hdr->fam = PP2_FAM_UNSPEC | PP2_TRANS_UNSPEC;
 		ret = PP2_HDR_LEN_UNSPEC;
 	}
+	else {
+		/* IPv4 for both src and dst */
+		if (src->ss_family == AF_INET && dst->ss_family == AF_INET) {
+			if (buf_len < PP2_HDR_LEN_INET)
+				return 0;
+			hdr->ver_cmd = PP2_VERSION | PP2_CMD_PROXY;
+			hdr->fam = PP2_FAM_INET | PP2_TRANS_STREAM;
+			hdr->addr.ip4.src_addr = ((struct sockaddr_in *)src)->sin_addr.s_addr;
+			hdr->addr.ip4.src_port = ((struct sockaddr_in *)src)->sin_port;
+			hdr->addr.ip4.dst_addr = ((struct sockaddr_in *)dst)->sin_addr.s_addr;
+			hdr->addr.ip4.dst_port = ((struct sockaddr_in *)dst)->sin_port;
+			ret = PP2_HDR_LEN_INET;
+		}
+		/* IPv6 for at least one of src and dst */
+		else {
+			struct in6_addr tmp;
 
-	if (conn_get_alpn(remote, &value, &value_len)) {
+			if (buf_len < PP2_HDR_LEN_INET6)
+				return 0;
+			hdr->ver_cmd = PP2_VERSION | PP2_CMD_PROXY;
+			hdr->fam = PP2_FAM_INET6 | PP2_TRANS_STREAM;
+			if (src->ss_family == AF_INET) {
+				v4tov6(&tmp, &((struct sockaddr_in *)src)->sin_addr);
+				memcpy(hdr->addr.ip6.src_addr, &tmp, 16);
+				hdr->addr.ip6.src_port = ((struct sockaddr_in *)src)->sin_port;
+			}
+			else {
+				memcpy(hdr->addr.ip6.src_addr, &((struct sockaddr_in6 *)src)->sin6_addr, 16);
+				hdr->addr.ip6.src_port = ((struct sockaddr_in6 *)src)->sin6_port;
+			}
+			if (dst->ss_family == AF_INET) {
+				v4tov6(&tmp, &((struct sockaddr_in *)dst)->sin_addr);
+				memcpy(hdr->addr.ip6.dst_addr, &tmp, 16);
+				hdr->addr.ip6.src_port = ((struct sockaddr_in *)src)->sin_port;
+			}
+			else {
+				memcpy(hdr->addr.ip6.dst_addr, &((struct sockaddr_in6 *)dst)->sin6_addr, 16);
+				hdr->addr.ip6.dst_port = ((struct sockaddr_in6 *)dst)->sin6_port;
+			}
+
+			ret = PP2_HDR_LEN_INET6;
+		}
+	}
+
+	if (remote && conn_get_alpn(remote, &value, &value_len)) {
 		if ((buf_len - ret) < sizeof(struct tlv))
 			return 0;
 		ret += make_tlv(&buf[ret], (buf_len - ret), PP2_TYPE_ALPN, value_len, value);
@@ -1056,7 +1094,7 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 			tlv->client |= PP2_CLIENT_SSL;
 			value = ssl_sock_get_proto_version(remote);
 			if (value) {
-				ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len - ret - ssl_tlv_len), PP2_SUBTYPE_SSL_VERSION, strlen(value)+1, value);
+				ssl_tlv_len += make_tlv(&buf[ret+ssl_tlv_len], (buf_len-ret-ssl_tlv_len), PP2_SUBTYPE_SSL_VERSION, strlen(value), value);
 			}
 			if (ssl_sock_get_cert_used_sess(remote)) {
 				tlv->client |= PP2_CLIENT_CERT_SESS;

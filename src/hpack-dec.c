@@ -25,7 +25,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -110,7 +110,7 @@ static inline int hpack_idx_to_phdr(uint32_t idx)
  * allocated there. In case of allocation failure, returns a string whose
  * pointer is NULL.
  */
-static inline struct ist hpack_alloc_string(struct chunk *store, int idx, struct ist in)
+static inline struct ist hpack_alloc_string(struct chunk *store, uint32_t idx, struct ist in)
 {
 	struct ist out;
 
@@ -177,6 +177,11 @@ int hpack_decode_frame(struct hpack_dht *dht, const uint8_t *raw, uint32_t len,
 				goto leave;
 			}
 
+			if (!hpack_valid_idx(dht, idx)) {
+				ret = -HPACK_ERR_TOO_LARGE;
+				goto leave;
+			}
+
 			value = hpack_alloc_string(tmp, idx, hpack_idx_to_value(dht, idx));
 			if (!value.ptr) {
 				ret = -HPACK_ERR_TOO_LARGE;
@@ -197,9 +202,21 @@ int hpack_decode_frame(struct hpack_dht *dht, const uint8_t *raw, uint32_t len,
 		}
 		else if (*raw >= 0x20 && *raw <= 0x3f) {
 			/* max dyn table size change */
+			if (ret) {
+				/* 7541#4.2.1 : DHT size update must only be at the beginning */
+				ret = -HPACK_ERR_TOO_LARGE;
+				goto leave;
+			}
+
 			idx = get_var_int(&raw, &len, 5);
 			if (len == (uint32_t)-1) { // truncated
 				ret = -HPACK_ERR_TRUNCATED;
+				goto leave;
+			}
+
+			if (idx > dht->size) {
+				hpack_debug_printf("##ERR@%d##\n", __LINE__);
+				ret = -HPACK_ERR_INVALID_ARGUMENT;
 				goto leave;
 			}
 			continue;
@@ -316,6 +333,11 @@ int hpack_decode_frame(struct hpack_dht *dht, const uint8_t *raw, uint32_t len,
 				goto leave;
 			}
 
+			if (!hpack_valid_idx(dht, idx)) {
+				ret = -HPACK_ERR_TOO_LARGE;
+				goto leave;
+			}
+
 			/* retrieve value */
 			huff = *raw & 0x80;
 			vlen = get_var_int(&raw, &len, 7);
@@ -349,8 +371,13 @@ int hpack_decode_frame(struct hpack_dht *dht, const uint8_t *raw, uint32_t len,
 			if (!must_index)
 				name.len = hpack_idx_to_phdr(idx);
 
-			if (!name.len)
-				name = hpack_idx_to_name(dht, idx);
+			if (!name.len) {
+				name = hpack_alloc_string(tmp, idx, hpack_idx_to_name(dht, idx));
+				if (!name.ptr) {
+					ret = -HPACK_ERR_TOO_LARGE;
+					goto leave;
+				}
+			}
 			/* <name> and <value> are correctly filled here */
 		}
 
@@ -376,7 +403,7 @@ int hpack_decode_frame(struct hpack_dht *dht, const uint8_t *raw, uint32_t len,
 		}
 
 		hpack_debug_printf("\e[1;34m%s\e[0m: ",
-		                   istpad(trash.str, name).ptr);
+		                   istpad(trash.str, name.ptr ? name : hpack_idx_to_name(dht, idx)).ptr);
 
 		hpack_debug_printf("\e[1;35m%s\e[0m [idx=%d, used=%d]\n",
 		                   istpad(trash.str, value).ptr,

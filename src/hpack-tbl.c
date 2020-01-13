@@ -25,7 +25,7 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -113,7 +113,7 @@ static inline unsigned int hpack_dht_get_tail(const struct hpack_dht *dht)
 /* dump the whole dynamic header table */
 static void hpack_dht_dump(const struct hpack_dht *dht)
 {
-	int i;
+	unsigned int i;
 	unsigned int slot;
 	char name[4096], value[4096];
 
@@ -259,17 +259,13 @@ int hpack_dht_insert(struct hpack_dht *dht, struct ist name, struct ist value)
 	uint32_t headroom, tailroom;
 
 	if (!hpack_dht_make_room(dht, name.len + value.len))
-		return -1;
-
-	used = dht->used;
-	prev = head = dht->head;
-	wrap = dht->wrap;
-	tail = hpack_dht_get_tail(dht);
+		return 0;
 
 	/* Now there is enough room in the table, that's guaranteed by the
 	 * protocol, but not necessarily where we need it.
 	 */
 
+	used = dht->used;
 	if (!used) {
 		/* easy, the table was empty */
 		dht->front = dht->head = 0;
@@ -281,6 +277,10 @@ int hpack_dht_insert(struct hpack_dht *dht, struct ist name, struct ist value)
 	}
 
 	/* compute the new head, used and wrap position */
+	prev = head = dht->head;
+	wrap = dht->wrap;
+	tail = hpack_dht_get_tail(dht);
+
 	used++;
 	head++;
 

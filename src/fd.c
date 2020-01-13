@@ -170,13 +170,17 @@ int nbpollers = 0;
 
 unsigned int *fd_cache = NULL; // FD events cache
 int fd_cache_num = 0;          // number of events in the cache
+unsigned long fd_cache_mask = 0; // Mask of threads with events in the cache
 
 THREAD_LOCAL int *fd_updt  = NULL;  // FD updates list
 THREAD_LOCAL int  fd_nbupdt = 0;   // number of updates in the list
 
+struct fdlist update_list; // Global update list
 __decl_hathreads(HA_SPINLOCK_T fdtab_lock);       /* global lock to protect fdtab array */
 __decl_hathreads(HA_RWLOCK_T   fdcache_lock);     /* global lock to protect fd_cache array */
 __decl_hathreads(HA_SPINLOCK_T poll_lock);        /* global lock to protect poll info */
+__decl_hathreads(HA_SPINLOCK_T fd_updt_lock);     /* global lock to protect the update list */
+
 
 /* Deletes an FD from the fdsets, and recomputes the maxfd limit.
  * The file descriptor is also closed.
@@ -191,6 +195,7 @@ static void fd_dodelete(int fd, int do_close)
 	}
 	if (cur_poller.clo)
 		cur_poller.clo(fd);
+	fdtab[fd].polled_mask = 0;
 
 	fd_release_cache_entry(fd);
 	fdtab[fd].state = 0;
@@ -198,11 +203,11 @@ static void fd_dodelete(int fd, int do_close)
 	port_range_release_port(fdinfo[fd].port_range, fdinfo[fd].local_port);
 	fdinfo[fd].port_range = NULL;
 	fdtab[fd].owner = NULL;
-	fdtab[fd].updated = 0;
 	fdtab[fd].new = 0;
 	fdtab[fd].thread_mask = 0;
-	if (do_close)
+	if (do_close) {
 		close(fd);
+	}
 	HA_SPIN_UNLOCK(FD_LOCK, &fdtab[fd].lock);
 
 	HA_SPIN_LOCK(FDTAB_LOCK, &fdtab_lock);
@@ -236,17 +241,21 @@ void fd_process_cached_events()
 {
 	int fd, entry, e;
 
-	if (!fd_cache_num)
-		return;
-
 	HA_RWLOCK_RDLOCK(FDCACHE_LOCK, &fdcache_lock);
+	fd_cache_mask &= ~tid_bit;
 	for (entry = 0; entry < fd_cache_num; ) {
 		fd = fd_cache[entry];
 
-		if (!(fdtab[fd].thread_mask & tid_bit))
+		if (!(fdtab[fd].thread_mask & tid_bit)) {
+			activity[tid].fd_skip++;
 			goto next;
-		if (HA_SPIN_TRYLOCK(FD_LOCK, &fdtab[fd].lock))
+		}
+
+		fd_cache_mask |= tid_bit;
+		if (HA_SPIN_TRYLOCK(FD_LOCK, &fdtab[fd].lock)) {
+			activity[tid].fd_lock++;
 			goto next;
+		}
 
 		HA_RWLOCK_RDUNLOCK(FDCACHE_LOCK, &fdcache_lock);
 
@@ -272,8 +281,10 @@ void fd_process_cached_events()
 		/* If the fd was removed from the cache, it has been
 		 * replaced by the next one that we don't want to skip !
 		 */
-		if (entry < fd_cache_num && fd_cache[entry] != fd)
+		if (entry < fd_cache_num && fd_cache[entry] != fd) {
+			activity[tid].fd_del++;
 			continue;
+		}
 	  next:
 		entry++;
 	}
@@ -332,6 +343,9 @@ int init_pollers()
 	HA_SPIN_INIT(&fdtab_lock);
 	HA_RWLOCK_INIT(&fdcache_lock);
 	HA_SPIN_INIT(&poll_lock);
+	HA_SPIN_INIT(&fd_updt_lock);
+	update_list.first = update_list.last = -1;
+
 	do {
 		bp = NULL;
 		for (p = 0; p < nbpollers; p++)

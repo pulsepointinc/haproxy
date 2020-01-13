@@ -505,17 +505,21 @@ static inline void conn_sock_read0(struct connection *c)
 }
 
 /* write shutdown, indication that the upper layer is not willing to send
- * anything anymore and wants to close after pending data are sent.
+ * anything anymore and wants to close after pending data are sent. The
+ * <clean> argument will allow not to perform the socket layer shutdown if
+ * equal to 0.
  */
-static inline void conn_sock_shutw(struct connection *c)
+static inline void conn_sock_shutw(struct connection *c, int clean)
 {
 	c->flags |= CO_FL_SOCK_WR_SH;
 	conn_refresh_polling_flags(c);
 	__conn_sock_stop_send(c);
 	conn_cond_update_sock_polling(c);
 
-	/* don't perform a clean shutdown if we're going to reset */
-	if (conn_ctrl_ready(c) && !fdtab[c->handle.fd].linger_risk)
+	/* don't perform a clean shutdown if we're going to reset or
+	 * if the shutr was already received.
+	 */
+	if (conn_ctrl_ready(c) && !(c->flags & CO_FL_SOCK_RD_SH) && clean)
 		shutdown(c->handle.fd, SHUT_WR);
 }
 
@@ -697,7 +701,20 @@ static inline void conn_free(struct connection *conn)
 /* Release a conn_stream, and kill the connection if it was the last one */
 static inline void cs_destroy(struct conn_stream *cs)
 {
-	cs->conn->mux->detach(cs);
+	if (cs->conn->mux)
+		cs->conn->mux->detach(cs);
+	else {
+		/* It's too early to have a mux, let's just destroy
+		 * the connection
+		 */
+		struct connection *conn = cs->conn;
+
+		conn_stop_tracking(conn);
+		conn_full_close(conn);
+		if (conn->destroy_cb)
+			conn->destroy_cb(conn);
+		conn_free(conn);
+	}
 	cs_free(cs);
 }
 
@@ -893,6 +910,15 @@ static inline const struct mux_ops *alpn_get_mux(const struct ist token, int htt
 			fallback = item->mux;
 	}
 	return fallback;
+}
+
+/* returns 0 if the connection is valid and is a frontend connection, otherwise
+ * returns 1 indicating it's a backend connection. And uninitialized connection
+ * also returns 1 to better handle the usage in the middle of initialization.
+ */
+static inline int conn_is_back(const struct connection *conn)
+{
+	return !objt_listener(conn->target);
 }
 
 /* finds the best mux for incoming connection <conn> and mode <http_mode> for

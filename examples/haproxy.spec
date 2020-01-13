@@ -1,6 +1,6 @@
 Summary: HA-Proxy is a TCP/HTTP reverse proxy for high availability environments
 Name: haproxy
-Version: 1.8.0
+Version: 1.8.23
 Release: 1
 License: GPL
 Group: System Environment/Daemons
@@ -74,6 +74,75 @@ fi
 %attr(0755,root,root) %config %{_sysconfdir}/rc.d/init.d/%{name}
 
 %changelog
+* Mon Nov 25 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.23
+
+* Fri Oct 25 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.22
+
+* Fri Aug 16 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.21
+
+* Thu Apr 25 2019 Christopher Faulet <cfaulet@haproxy.com>
+- updated to 1.8.20
+
+* Mon Feb 11 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.19
+
+* Wed Feb  6 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.18
+
+* Tue Jan  8 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.17
+
+* Fri Dec 21 2018 William Lallemand <wlallemand@haproxy.org>
+- updated to 1.8.16
+
+* Thu Dec 13 2018 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.15
+
+* Thu Sep 20 2018 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.14
+
+* Mon Jul 30 2018 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.13
+
+* Wed Jun 27 2018 William Lallemand <wlallemand@haproxy.org>
+- updated to 1.8.12
+
+* Tue Jun 26 2018 William Lallemand <wlallemand@haproxy.org>
+- updated to 1.8.11
+
+* Fri Jun 22 2018 William Lallemand <wlallemand@haproxy.org>
+- updated to 1.8.10
+
+* Fri May 18 2018 William Lallemand <wlallemand@haproxy.org>
+- updated to 1.8.9
+
+* Thu Apr 19 2018 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.8
+
+* Sat Apr  7 2018 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.7
+
+* Thu Apr  5 2018 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.6
+
+* Fri Mar 23 2018 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.5
+
+* Thu Feb  8 2018 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.4
+
+* Sat Dec 30 2017 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.3
+
+* Sat Dec 23 2017 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.2
+
+* Sun Dec  3 2017 Willy Tarreau <w@1wt.eu>
+- updated to 1.8.1
+
 * Sun Nov 26 2017 Willy Tarreau <w@1wt.eu>
 - updated to 1.8.0
 

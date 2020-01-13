@@ -39,6 +39,7 @@ unsigned int nb_tasks_cur = 0;     /* copy of the tasks count */
 unsigned int niced_tasks = 0;      /* number of niced tasks in the run queue */
 
 THREAD_LOCAL struct task *curr_task = NULL; /* task currently running or NULL */
+THREAD_LOCAL struct eb32sc_node *rq_next = NULL; /* Next task to be potentially run */
 
 __decl_hathreads(HA_SPINLOCK_T __attribute__((aligned(64))) rq_lock); /* spin lock related to run queue */
 __decl_hathreads(HA_SPINLOCK_T __attribute__((aligned(64))) wq_lock); /* spin lock related to wait queue */
@@ -186,7 +187,6 @@ void process_runnable_tasks()
 	struct task *t;
 	int i;
 	int max_processed;
-	struct eb32sc_node *rq_next;
 	struct task *local_tasks[16];
 	int local_tasks_count;
 	int final_tasks_count;
@@ -196,8 +196,10 @@ void process_runnable_tasks()
 	max_processed = 200;
 	if (unlikely(global.nbthread <= 1)) {
 		/* when no lock is needed, this loop is much faster */
-		if (!(active_tasks_mask & tid_bit))
+		if (!(active_tasks_mask & tid_bit)) {
+			activity[tid].empty_rq++;
 			return;
+		}
 
 		active_tasks_mask &= ~tid_bit;
 		rq_next = eb32sc_lookup_ge(&rqueue, rqueue_ticks - TIMER_LOOK_BACK, tid_bit);
@@ -225,8 +227,14 @@ void process_runnable_tasks()
 			 */
 			if (likely(t->process == process_stream))
 				t = process_stream(t);
-			else
-				t = t->process(t);
+			else {
+				if (t->process != NULL)
+					t = t->process(t);
+				else {
+					__task_free(t);
+					t = NULL;
+				}
+			}
 			curr_task = NULL;
 
 			if (likely(t != NULL)) {
@@ -245,6 +253,7 @@ void process_runnable_tasks()
 			max_processed--;
 			if (max_processed <= 0) {
 				active_tasks_mask |= tid_bit;
+				activity[tid].long_rq++;
 				break;
 			}
 		}
@@ -254,6 +263,7 @@ void process_runnable_tasks()
 	HA_SPIN_LOCK(TASK_RQ_LOCK, &rq_lock);
 	if (!(active_tasks_mask & tid_bit)) {
 		HA_SPIN_UNLOCK(TASK_RQ_LOCK, &rq_lock);
+		activity[tid].empty_rq++;
 		return;
 	}
 
@@ -305,8 +315,14 @@ void process_runnable_tasks()
 			curr_task = t;
 			if (likely(t->process == process_stream))
 				t = process_stream(t);
-			else
-				t = t->process(t);
+			else {
+				if (t->process != NULL)
+					t = t->process(t);
+				else {
+					__task_free(t);
+					t = NULL;
+				}
+			}
 			curr_task = NULL;
 			if (t)
 				local_tasks[final_tasks_count++] = t;
@@ -335,10 +351,58 @@ void process_runnable_tasks()
 		HA_SPIN_LOCK(TASK_RQ_LOCK, &rq_lock);
 		if (max_processed <= 0) {
 			active_tasks_mask |= tid_bit;
+			activity[tid].long_rq++;
 			break;
 		}
 	}
 	HA_SPIN_UNLOCK(TASK_RQ_LOCK, &rq_lock);
+}
+
+/* create a work list array for <nbthread> threads, using tasks made of
+ * function <fct>. The context passed to the function will be the pointer to
+ * the thread's work list, which will contain a copy of argument <arg>. The
+ * wake up reason will be TASK_WOKEN_OTHER. The pointer to the work_list array
+ * is returned on success, otherwise NULL on failure.
+ */
+struct work_list *work_list_create(int nbthread,
+                                   struct task *(*fct)(struct task *),
+                                   void *arg)
+{
+	struct work_list *wl;
+	int i;
+
+	wl = calloc(nbthread, sizeof(*wl));
+	if (!wl)
+		goto fail;
+
+	for (i = 0; i < nbthread; i++) {
+		LIST_INIT(&wl[i].head);
+		wl[i].task = task_new(1UL << i);
+		if (!wl[i].task)
+			goto fail;
+		wl[i].task->process = fct;
+		wl[i].task->context = &wl[i];
+		wl[i].arg = arg;
+	}
+	return wl;
+
+ fail:
+	work_list_destroy(wl, nbthread);
+	return NULL;
+}
+
+/* destroy work list <work> */
+void work_list_destroy(struct work_list *work, int nbthread)
+{
+	int t;
+
+	if (!work)
+		return;
+	for (t = 0; t < nbthread; t++) {
+		task_delete(work[t].task);
+		task_free(work[t].task);
+	}
+	free(work);
 }
 
 /* perform minimal intializations, report 0 in case of error, 1 if OK. */

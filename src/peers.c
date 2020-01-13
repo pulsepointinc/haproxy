@@ -122,15 +122,13 @@ enum {
 /* Note: ids >= 128 contains   */
 /* id message cotains data     */
 /*******************************/
-enum {
-	PEER_MSG_STKT_UPDATE = 128,
-	PEER_MSG_STKT_INCUPDATE,
-	PEER_MSG_STKT_DEFINE,
-	PEER_MSG_STKT_SWITCH,
-	PEER_MSG_STKT_ACK,
-	PEER_MSG_STKT_UPDATE_TIMED,
-	PEER_MSG_STKT_INCUPDATE_TIMED,
-};
+#define PEER_MSG_STKT_UPDATE           0x80
+#define PEER_MSG_STKT_INCUPDATE        0x81
+#define PEER_MSG_STKT_DEFINE           0x82
+#define PEER_MSG_STKT_SWITCH           0x83
+#define PEER_MSG_STKT_ACK              0x84
+#define PEER_MSG_STKT_UPDATE_TIMED     0x85
+#define PEER_MSG_STKT_INCUPDATE_TIMED  0x86
 
 /**********************************/
 /* Peer Session IO handler states */
@@ -174,7 +172,7 @@ enum {
 #define PEER_DWNGRD_MINOR_VER 0
 
 struct peers *cfg_peers = NULL;
-static void peer_session_forceshutdown(struct appctx *appctx);
+static void peer_session_forceshutdown(struct peer *peer);
 
 /* This function encode an uint64 to 'dynamic' length format.
    The encoded value is written at address *str, and the
@@ -495,14 +493,52 @@ static int peer_prepare_ackmsg(struct shared_table *st, char *msg, size_t size)
 }
 
 /*
+ * Function to deinit connected peer
+ */
+void __peer_session_deinit(struct peer *peer)
+{
+	struct stream_interface *si;
+	struct stream *s;
+	struct peers *peers;
+
+	if (!peer->appctx)
+		return;
+
+	si = peer->appctx->owner;
+	if (!si)
+		return;
+
+	s = si_strm(si);
+	if (!s)
+		return;
+
+	peers = strm_fe(s)->parent;
+	if (!peers)
+		return;
+
+	/* Re-init current table pointers to force announcement on re-connect */
+	peer->remote_table = peer->last_local_table = NULL;
+	peer->appctx = NULL;
+	if (peer->flags & PEER_F_LEARN_ASSIGN) {
+		/* unassign current peer for learning */
+		peer->flags &= ~(PEER_F_LEARN_ASSIGN);
+		peers->flags &= ~(PEERS_F_RESYNC_ASSIGN|PEERS_F_RESYNC_PROCESS);
+
+		/* reschedule a resync */
+		peers->resync_timeout = tick_add(now_ms, MS_TO_TICKS(5000));
+	}
+	/* reset teaching and learning flags to 0 */
+	peer->flags &= PEER_TEACH_RESET;
+	peer->flags &= PEER_LEARN_RESET;
+	task_wakeup(peers->sync_task, TASK_WOKEN_MSG);
+}
+
+/*
  * Callback to release a session with a peer
  */
 static void peer_session_release(struct appctx *appctx)
 {
-	struct stream_interface *si = appctx->owner;
-	struct stream *s = si_strm(si);
 	struct peer *peer = appctx->ctx.peers.ptr;
-	struct peers *peers = strm_fe(s)->parent;
 
 	/* appctx->ctx.peers.ptr is not a peer session */
 	if (appctx->st0 < PEER_SESS_ST_SENDSUCCESS)
@@ -511,24 +547,9 @@ static void peer_session_release(struct appctx *appctx)
 	/* peer session identified */
 	if (peer) {
 		HA_SPIN_LOCK(PEER_LOCK, &peer->lock);
-		if (peer->appctx == appctx) {
-			/* Re-init current table pointers to force announcement on re-connect */
-			peer->remote_table = peer->last_local_table = NULL;
-			peer->appctx = NULL;
-			if (peer->flags & PEER_F_LEARN_ASSIGN) {
-				/* unassign current peer for learning */
-				peer->flags &= ~(PEER_F_LEARN_ASSIGN);
-				peers->flags &= ~(PEERS_F_RESYNC_ASSIGN|PEERS_F_RESYNC_PROCESS);
-
-				/* reschedule a resync */
-				peers->resync_timeout = tick_add(now_ms, MS_TO_TICKS(5000));
-			}
-			/* reset teaching and learning flags to 0 */
-			peer->flags &= PEER_TEACH_RESET;
-			peer->flags &= PEER_LEARN_RESET;
-		}
+		if (peer->appctx == appctx)
+			__peer_session_deinit(peer);
 		HA_SPIN_UNLOCK(PEER_LOCK, &peer->lock);
-		task_wakeup(peers->sync_task, TASK_WOKEN_MSG);
 	}
 }
 
@@ -706,7 +727,7 @@ switchstate:
 					 * for a while.
 					 */
 					curpeer->reconnect = tick_add(now_ms, MS_TO_TICKS(50 + random() % 2000));
-					peer_session_forceshutdown(curpeer->appctx);
+					peer_session_forceshutdown(curpeer);
 				}
 				if (maj_ver != (unsigned int)-1 && min_ver != (unsigned int)-1) {
 					if (min_ver == PEER_DWNGRD_MINOR_VER) {
@@ -1195,9 +1216,7 @@ switchstate:
 						newts = stksess_new(st->table, NULL);
 						if (!newts)
 							goto ignore_msg;
-						/* Force expiratiion to remote date
-						   in case of first insert */
-						newts->expire = tick_add(now_ms, expire);
+
 						if (st->table->type == SMP_T_STR) {
 							unsigned int to_read, to_store;
 
@@ -1351,6 +1370,9 @@ switchstate:
 							}
 						}
 
+						/* Force new expiration */
+						ts->expire = tick_add(now_ms, expire);
+
 						HA_RWLOCK_WRUNLOCK(STK_SESS_LOCK, &ts->lock);
 						stktable_touch_remote(st->table, ts, 1);
 
@@ -1474,6 +1496,7 @@ incomplete:
 
 									msglen = peer_prepare_switchmsg(st, trash.str, trash.size);
 									if (!msglen) {
+										HA_SPIN_UNLOCK(STK_TABLE_LOCK, &st->table->lock);
 										/* internal error: message does not fit in trash */
 										appctx->st0 = PEER_SESS_ST_END;
 										goto switchstate;
@@ -1482,6 +1505,7 @@ incomplete:
 									/* message to buffer */
 									repl = ci_putblk(si_ic(si), trash.str, msglen);
 									if (repl <= 0) {
+										HA_SPIN_UNLOCK(STK_TABLE_LOCK, &st->table->lock);
 										/* no more write possible */
 										if (repl == -1) {
 											goto full;
@@ -1831,11 +1855,14 @@ static struct applet peer_applet = {
 	.release = peer_session_release,
 };
 
+
 /*
  * Use this function to force a close of a peer session
  */
-static void peer_session_forceshutdown(struct appctx *appctx)
+static void peer_session_forceshutdown(struct peer *peer)
 {
+	struct appctx *appctx = peer->appctx;
+
 	/* Note that the peer sessions which have just been created
 	 * (->st0 == PEER_SESS_ST_CONNECT) must not
 	 * be shutdown, if not, the TCP session will never be closed
@@ -1847,6 +1874,8 @@ static void peer_session_forceshutdown(struct appctx *appctx)
 
 	if (appctx->applet != &peer_applet)
 		return;
+
+	__peer_session_deinit(peer);
 
 	appctx->st0 = PEER_SESS_ST_END;
 	appctx_wakeup(appctx);
@@ -1910,6 +1939,7 @@ static struct appctx *peer_session_create(struct peers *peers, struct peer *peer
 	appctx_wakeup(appctx);
 
 	/* initiate an outgoing connection */
+	s->si[1].flags |= SI_FL_NOLINGER;
 	si_set_state(&s->si[1], SI_ST_ASS);
 
 	/* automatically prepare the stream interface to connect to the
@@ -2092,8 +2122,7 @@ static struct task *process_peer_sync(struct task * task)
 				 */
 				ps->reconnect = tick_add(now_ms, MS_TO_TICKS(50 + random() % 2000));
 				if (ps->appctx) {
-					peer_session_forceshutdown(ps->appctx);
-					ps->appctx = NULL;
+					peer_session_forceshutdown(ps);
 				}
 			}
 		}
@@ -2102,7 +2131,7 @@ static struct task *process_peer_sync(struct task * task)
 		if (ps->flags & PEER_F_TEACH_COMPLETE) {
 			if (peers->flags & PEERS_F_DONOTSTOP) {
 				/* resync of new process was complete, current process can die now */
-				HA_ATOMIC_ADD(&jobs, 1);
+				HA_ATOMIC_SUB(&jobs, 1);
 				peers->flags &= ~PEERS_F_DONOTSTOP;
 				for (st = ps->tables; st ; st = st->next)
 					st->table->syncing--;
@@ -2155,9 +2184,9 @@ static struct task *process_peer_sync(struct task * task)
 
 
 /*
- *
+ * returns 0 in case of error.
  */
-void peers_init_sync(struct peers *peers)
+int peers_init_sync(struct peers *peers)
 {
 	struct peer * curpeer;
 	struct listener *listener;
@@ -2169,10 +2198,14 @@ void peers_init_sync(struct peers *peers)
 	list_for_each_entry(listener, &peers->peers_fe->conf.listeners, by_fe)
 		listener->maxconn = peers->peers_fe->maxconn;
 	peers->sync_task = task_new(MAX_THREADS_MASK);
+	if (!peers->sync_task)
+		return 0;
+
 	peers->sync_task->process = process_peer_sync;
 	peers->sync_task->context = (void *)peers;
 	peers->sighandler = signal_register_task(0, peers->sync_task, 0);
 	task_wakeup(peers->sync_task, TASK_WOKEN_INIT);
+	return 1;
 }
 
 

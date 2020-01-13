@@ -97,6 +97,7 @@ struct global {
 	int ssl_handshake_max_cost; /* how many bytes an SSL handshake may use */
 	int ssl_used_frontend;      /* non-zero if SSL is used in a frontend */
 	int ssl_used_backend;       /* non-zero if SSL is used in a backend */
+	int ssl_used_async_engines; /* number of used async engines */
 	unsigned int ssl_server_verify; /* default verify mode on servers side */
 	struct freq_ctr conn_per_sec;
 	struct freq_ctr sess_per_sec;
@@ -162,17 +163,44 @@ struct global {
 			mode_t mode;    /* 0 to leave unchanged */
 		} ux;
 	} unix_bind;
+	struct proxy *stats_fe;     /* the frontend holding the stats settings */
+	struct vars   vars;         /* list of variables for the process scope. */
 #ifdef USE_CPU_AFFINITY
 	struct {
 		unsigned long proc[LONGBITS];             /* list of CPU masks for the 32/64 first processes */
-		unsigned long thread[LONGBITS][LONGBITS]; /* list of CPU masks for the 32/64 first threads per process */
+		unsigned long thread[LONGBITS][MAX_THREADS]; /* list of CPU masks for the 32/64 first threads per process */
 	} cpu_map;
 #endif
-	struct proxy *stats_fe;     /* the frontend holding the stats settings */
-	struct vars   vars;         /* list of variables for the process scope. */
+};
+
+/* per-thread activity reports. It's important that it's aligned on cache lines
+ * because some elements will be updated very often. Most counters are OK on
+ * 32-bit since this will be used during debugging sessions for troubleshooting
+ * in iterative mode.
+ */
+struct activity {
+	unsigned int loops;        // complete loops in run_poll_loop()
+	unsigned int wake_cache;   // active fd_cache prevented poll() from sleeping
+	unsigned int wake_tasks;   // active tasks prevented poll() from sleeping
+	unsigned int wake_applets; // active applets prevented poll() from sleeping
+	unsigned int wake_signal;  // pending signal prevented poll() from sleeping
+	unsigned int poll_exp;     // number of times poll() sees an expired timeout (includes wake_*)
+	unsigned int poll_drop;    // poller dropped a dead FD from the update list
+	unsigned int poll_dead;    // poller woke up with a dead FD
+	unsigned int poll_skip;    // poller skipped another thread's FD
+	unsigned int fd_skip;      // fd cache skipped another thread's FD
+	unsigned int fd_lock;      // fd cache skipped a locked FD
+	unsigned int fd_del;       // fd cache detected a deleted FD
+	unsigned int conn_dead;    // conn_fd_handler woke up on an FD indicating a dead connection
+	unsigned int stream;       // calls to process_stream()
+	unsigned int empty_rq;     // calls to process_runnable_tasks() with nothing for the thread
+	unsigned int long_rq;      // process_runnable_tasks() left with tasks in the run queue
+	char __pad[0]; // unused except to check remaining room
+	char __end[0] __attribute__((aligned(64))); // align size to 64.
 };
 
 extern struct global global;
+extern struct activity activity[MAX_THREADS];
 extern int  pid;                /* current process id */
 extern int  relative_pid;       /* process id starting at 1 */
 extern unsigned long pid_bit;   /* bit corresponding to the process id */
@@ -185,7 +213,7 @@ extern const int zero;
 extern const int one;
 extern const struct linger nolinger;
 extern int stopping;	/* non zero means stopping in progress */
-extern int killed;	/* non zero means a hard-stop is triggered */
+extern int killed;	/* >0 means a hard-stop is triggered, >1 means hard-stop immediately */
 extern char hostname[MAX_HOSTNAME_LEN];
 extern char localpeer[MAX_HOSTNAME_LEN];
 extern struct list global_listener_queue; /* list of the temporarily limited listeners */

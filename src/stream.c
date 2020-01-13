@@ -114,10 +114,7 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin)
 	s->logs.level = 0;
 	s->logs.accept_date = sess->accept_date; /* user-visible date for logging */
 	s->logs.tv_accept = sess->tv_accept;   /* corrected date for internal use */
-	/* This function is called just after the handshake, so the handshake duration is
-	 * between the accept time and now.
-	 */
-	s->logs.t_handshake = tv_ms_elapsed(&sess->tv_accept, &now);
+	s->logs.t_handshake = sess->t_handshake;
 	s->logs.t_idle = -1;
 	tv_zero(&s->logs.tv_request);
 	s->logs.t_queue = -1;
@@ -152,7 +149,7 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin)
 	s->si[0].flags = SI_FL_NONE;
 	s->si[1].flags = SI_FL_ISBACK;
 
-	s->uniq_id = global.req_count++;
+	s->uniq_id = HA_ATOMIC_XADD(&global.req_count, 1);
 
 	/* OK, we're keeping the stream, so let's properly initialize the stream */
 	LIST_INIT(&s->back_refs);
@@ -194,6 +191,9 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin)
 	si_reset(&s->si[0]);
 	si_set_state(&s->si[0], SI_ST_EST);
 	s->si[0].hcto = sess->fe->timeout.clientfin;
+
+	if (cs && cs->conn->mux && cs->conn->mux->flags & MX_FL_CLEAN_ABRT)
+		s->si[0].flags |= SI_FL_CLEAN_ABRT;
 
 	/* attach the incoming connection to the stream interface now. */
 	if (cs)
@@ -282,8 +282,8 @@ struct stream *stream_new(struct session *sess, enum obj_type *origin)
  out_fail_accept:
 	flt_stream_release(s, 0);
 	task_free(t);
- out_fail_alloc:
 	LIST_DEL(&s->list);
+ out_fail_alloc:
 	pool_free(pool_head_stream, s);
 	return NULL;
 }
@@ -297,6 +297,7 @@ static void stream_free(struct stream *s)
 	struct proxy *fe = sess->fe;
 	struct bref *bref, *back;
 	struct conn_stream *cli_cs = objt_cs(s->si[0].end);
+	int must_free_sess;
 	int i;
 
 	if (s->pend_pos)
@@ -305,7 +306,7 @@ static void stream_free(struct stream *s)
 	if (objt_server(s->target)) { /* there may be requests left pending in queue */
 		if (s->flags & SF_CURR_SESS) {
 			s->flags &= ~SF_CURR_SESS;
-			HA_ATOMIC_SUB(&objt_server(s->target)->cur_sess, 1);
+			HA_ATOMIC_SUB(&__objt_server(s->target)->cur_sess, 1);
 		}
 		if (may_dequeue_tasks(objt_server(s->target), s->be))
 			process_srv_queue(objt_server(s->target));
@@ -338,6 +339,9 @@ static void stream_free(struct stream *s)
 		offer_buffers(NULL, tasks_run_queue + applets_active_queue);
 	}
 
+	pool_free(pool_head_uniqueid, s->unique_id);
+	s->unique_id = NULL;
+
 	hlua_ctx_destroy(s->hlua);
 	s->hlua = NULL;
 	if (s->txn)
@@ -364,6 +368,18 @@ static void stream_free(struct stream *s)
 	flt_stream_release(s, 0);
 
 	if (fe) {
+		if (s->req_cap) {
+			struct cap_hdr *h;
+			for (h = fe->req_cap; h; h = h->next)
+				pool_free(h->pool, s->req_cap[h->index]);
+		}
+
+		if (s->res_cap) {
+			struct cap_hdr *h;
+			for (h = fe->rsp_cap; h; h = h->next)
+				pool_free(h->pool, s->res_cap[h->index]);
+		}
+
 		pool_free(fe->rsp_cap_pool, s->res_cap);
 		pool_free(fe->req_cap_pool, s->req_cap);
 	}
@@ -388,12 +404,15 @@ static void stream_free(struct stream *s)
 	LIST_DEL(&s->list);
 	HA_SPIN_UNLOCK(STRMS_LOCK, &streams_lock);
 
+	/* applets do not release session yet */
+	must_free_sess = objt_appctx(sess->origin) && sess->origin == s->si[0].end;
+
 	si_release_endpoint(&s->si[1]);
 	si_release_endpoint(&s->si[0]);
 
-	/* FIXME: for now we have a 1:1 relation between stream and session so
-	 * the stream must free the session.
-	 */
+	if (must_free_sess)
+		session_free(sess);
+
 	pool_free(pool_head_stream, s);
 
 	/* We may want to free the maximum amount of pools if the proxy is stopping */
@@ -589,7 +608,8 @@ static int sess_update_st_con_tcp(struct stream *s)
 			 */
 			si->state    = SI_ST_EST;
 			si->err_type = SI_ET_DATA_ERR;
-			rep->flags |= CF_READ_ERROR | CF_WRITE_ERROR;
+			req->flags |= CF_WRITE_ERROR;
+			rep->flags |= CF_READ_ERROR;
 			return 1;
 		}
 		si->exp   = TICK_ETERNITY;
@@ -615,7 +635,7 @@ static int sess_update_st_con_tcp(struct stream *s)
 	    unlikely((rep->flags & CF_SHUTW) ||
 		     ((req->flags & CF_SHUTW_NOW) && /* FIXME: this should not prevent a connection from establishing */
 		      ((!(req->flags & (CF_WRITE_ACTIVITY|CF_WRITE_EVENT)) && channel_is_empty(req)) ||
-		       s->be->options & PR_O_ABRT_CLOSE)))) {
+		       ((s->be->options & PR_O_ABRT_CLOSE) && !(s->si[0].flags & SI_FL_CLEAN_ABRT)))))) {
 		/* give up */
 		si_shutw(si);
 		si->err_type |= SI_ET_CONN_ABRT;
@@ -657,7 +677,7 @@ static int sess_update_st_cer(struct stream *s)
 
 		if (s->flags & SF_CURR_SESS) {
 			s->flags &= ~SF_CURR_SESS;
-			HA_ATOMIC_SUB(&objt_server(s->target)->cur_sess, 1);
+			HA_ATOMIC_SUB(&__objt_server(s->target)->cur_sess, 1);
 		}
 
 		if ((si->flags & SI_FL_ERR) &&
@@ -738,7 +758,7 @@ static int sess_update_st_cer(struct stream *s)
 		si->state = SI_ST_REQ;
 	} else {
 		if (objt_server(s->target))
-			HA_ATOMIC_ADD(&objt_server(s->target)->counters.retries, 1);
+			HA_ATOMIC_ADD(&__objt_server(s->target)->counters.retries, 1);
 		HA_ATOMIC_ADD(&s->be->be_counters.retries, 1);
 		si->state = SI_ST_ASS;
 	}
@@ -826,8 +846,9 @@ static void sess_establish(struct stream *s)
 static int check_req_may_abort(struct channel *req, struct stream *s)
 {
 	return ((req->flags & (CF_READ_ERROR)) ||
-	        ((req->flags & CF_SHUTW_NOW) &&  /* empty and client aborted */
-	         (channel_is_empty(req) || s->be->options & PR_O_ABRT_CLOSE)));
+	        ((req->flags & (CF_SHUTW_NOW|CF_SHUTW)) &&  /* empty and client aborted */
+	         (channel_is_empty(req) ||
+		  ((s->be->options & PR_O_ABRT_CLOSE) && !(s->si[0].flags & SI_FL_CLEAN_ABRT)))));
 }
 
 /* Update back stream interface status for input states SI_ST_ASS, SI_ST_QUE,
@@ -921,7 +942,7 @@ static void sess_update_stream_int(struct stream *s)
 	}
 	else if (si->state == SI_ST_QUE) {
 		/* connection request was queued, check for any update */
-		if (!s->pend_pos) {
+		if (!pendconn_dequeue(s)) {
 			/* The connection is not in the queue anymore. Either
 			 * we have a server connection slot available and we
 			 * go directly to the assigned state, or we need to
@@ -1619,6 +1640,8 @@ struct task *process_stream(struct task *t)
 	struct channel *req, *res;
 	struct stream_interface *si_f, *si_b;
 
+	activity[tid].stream++;
+
 	req = &s->req;
 	res = &s->res;
 
@@ -2117,8 +2140,10 @@ struct task *process_stream(struct task *t)
 	if (!(req->flags & (CF_KERN_SPLICING|CF_SHUTR)) &&
 	    req->to_forward &&
 	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (objt_cs(si_f->end) && __objt_cs(si_f->end)->conn->xprt && __objt_cs(si_f->end)->conn->xprt->rcv_pipe) &&
-	    (objt_cs(si_b->end) && __objt_cs(si_b->end)->conn->xprt && __objt_cs(si_b->end)->conn->xprt->snd_pipe) &&
+	    (objt_cs(si_f->end) && __objt_cs(si_f->end)->conn->xprt && __objt_cs(si_f->end)->conn->xprt->rcv_pipe &&
+	     __objt_cs(si_f->end)->conn->mux && __objt_cs(si_f->end)->conn->mux->rcv_pipe) &&
+	    (objt_cs(si_b->end) && __objt_cs(si_b->end)->conn->xprt && __objt_cs(si_b->end)->conn->xprt->snd_pipe &&
+	     __objt_cs(si_b->end)->conn->mux && __objt_cs(si_b->end)->conn->mux->snd_pipe) &&
 	    (pipes_used < global.maxpipes) &&
 	    (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_REQ) ||
 	     (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&
@@ -2299,8 +2324,10 @@ struct task *process_stream(struct task *t)
 	if (!(res->flags & (CF_KERN_SPLICING|CF_SHUTR)) &&
 	    res->to_forward &&
 	    (global.tune.options & GTUNE_USE_SPLICE) &&
-	    (objt_cs(si_f->end) && __objt_cs(si_f->end)->conn->xprt && __objt_cs(si_f->end)->conn->xprt->snd_pipe) &&
-	    (objt_cs(si_b->end) && __objt_cs(si_b->end)->conn->xprt && __objt_cs(si_b->end)->conn->xprt->rcv_pipe) &&
+	    (objt_cs(si_f->end) && __objt_cs(si_f->end)->conn->xprt && __objt_cs(si_f->end)->conn->xprt->snd_pipe &&
+	     __objt_cs(si_f->end)->conn->mux && __objt_cs(si_f->end)->conn->mux->snd_pipe) &&
+	    (objt_cs(si_b->end) && __objt_cs(si_b->end)->conn->xprt && __objt_cs(si_b->end)->conn->xprt->rcv_pipe &&
+	     __objt_cs(si_b->end)->conn->mux && __objt_cs(si_b->end)->conn->mux->rcv_pipe) &&
 	    (pipes_used < global.maxpipes) &&
 	    (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_RTR) ||
 	     (((sess->fe->options2|s->be->options2) & PR_O2_SPLIC_AUT) &&
@@ -2705,13 +2732,9 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 	if (appctx->ctx.sess.section > 0 && appctx->ctx.sess.uid != strm->uniq_id) {
 		/* stream changed, no need to go any further */
 		chunk_appendf(&trash, "  *** session terminated while we were watching it ***\n");
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_applet_cant_put(si);
-			return 0;
-		}
-		appctx->ctx.sess.uid = 0;
-		appctx->ctx.sess.section = 0;
-		return 1;
+		if (ci_putchk(si_ic(si), &trash) == -1)
+			goto full;
+		goto done;
 	}
 
 	switch (appctx->ctx.sess.section) {
@@ -2747,8 +2770,9 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 		}
 
 		chunk_appendf(&trash,
-			     "  flags=0x%x, conn_retries=%d, srv_conn=%p, pend_pos=%p\n",
-			     strm->flags, strm->si[1].conn_retries, strm->srv_conn, strm->pend_pos);
+			     "  flags=0x%x, conn_retries=%d, srv_conn=%p, pend_pos=%p waiting=%d\n",
+			     strm->flags, strm->si[1].conn_retries, strm->srv_conn, strm->pend_pos,
+			     !LIST_ISEMPTY(&strm->buffer_wait.list));
 
 		chunk_appendf(&trash,
 			     "  frontend=%s (id=%u mode=%s), listener=%s (id=%u)",
@@ -2847,9 +2871,13 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 
 		if (strm->txn)
 			chunk_appendf(&trash,
-			     "  txn=%p flags=0x%x meth=%d status=%d req.st=%s rsp.st=%s waiting=%d\n",
+			      "  txn=%p flags=0x%x meth=%d status=%d req.st=%s rsp.st=%s\n"
+			      "      req.f=0x%02x blen=%llu chnk=%llu next=%u\n"
+			      "      rsp.f=0x%02x blen=%llu chnk=%llu next=%u\n",
 			      strm->txn, strm->txn->flags, strm->txn->meth, strm->txn->status,
-			      h1_msg_state_str(strm->txn->req.msg_state), h1_msg_state_str(strm->txn->rsp.msg_state), !LIST_ISEMPTY(&strm->buffer_wait.list));
+			      h1_msg_state_str(strm->txn->req.msg_state), h1_msg_state_str(strm->txn->rsp.msg_state),
+			      strm->txn->req.flags, strm->txn->req.body_len, strm->txn->req.chunk_len, strm->txn->req.next,
+			      strm->txn->rsp.flags, strm->txn->rsp.body_len, strm->txn->rsp.chunk_len, strm->txn->rsp.next);
 
 		chunk_appendf(&trash,
 			     "  si[0]=%p (state=%s flags=0x%02x endp0=%s:%p exp=%s, et=0x%03x)\n",
@@ -2896,7 +2924,7 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 			              conn->handle.fd,
 			              conn->handle.fd >= 0 ? fdtab[conn->handle.fd].state : 0,
 			              conn->handle.fd >= 0 ? fdtab[conn->handle.fd].cache : 0,
-			              conn->handle.fd >= 0 ? fdtab[conn->handle.fd].updated : 0,
+			              conn->handle.fd >= 0 ? !!(fdtab[conn->handle.fd].update_mask & tid_bit) : 0,
 				      conn->handle.fd >= 0 ? fdtab[conn->handle.fd].thread_mask: 0);
 		}
 		else if ((tmpctx = objt_appctx(strm->si[0].end)) != NULL) {
@@ -2929,7 +2957,7 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 			              conn->handle.fd,
 			              conn->handle.fd >= 0 ? fdtab[conn->handle.fd].state : 0,
 			              conn->handle.fd >= 0 ? fdtab[conn->handle.fd].cache : 0,
-			              conn->handle.fd >= 0 ? fdtab[conn->handle.fd].updated : 0,
+			              conn->handle.fd >= 0 ? !!(fdtab[conn->handle.fd].update_mask & tid_bit) : 0,
 				      conn->handle.fd >= 0 ? fdtab[conn->handle.fd].thread_mask: 0);
 		}
 		else if ((tmpctx = objt_appctx(strm->si[1].end)) != NULL) {
@@ -3001,17 +3029,18 @@ static int stats_dump_full_strm_to_buffer(struct stream_interface *si, struct st
 			     strm->txn ? strm->txn->rsp.next : 0, strm->res.buf->i,
 			     strm->res.buf->size);
 
-		if (ci_putchk(si_ic(si), &trash) == -1) {
-			si_applet_cant_put(si);
-			return 0;
-		}
+		if (ci_putchk(si_ic(si), &trash) == -1)
+			goto full;
 
 		/* use other states to dump the contents */
 	}
 	/* end of dump */
+ done:
 	appctx->ctx.sess.uid = 0;
 	appctx->ctx.sess.section = 0;
 	return 1;
+ full:
+	return 0;
 }
 
 
@@ -3034,13 +3063,15 @@ static int cli_parse_show_sess(char **args, struct appctx *appctx, void *private
 
 /* This function dumps all streams' states onto the stream interface's
  * read buffer. It returns 0 if the output buffer is full and it needs
- * to be called again, otherwise non-zero. It is designed to be called
- * from stats_dump_sess_to_buffer() below.
+ * to be called again, otherwise non-zero. It proceeds in an isolated
+ * thread so there is no thread safety issue here.
  */
 static int cli_io_handler_dump_sess(struct appctx *appctx)
 {
 	struct stream_interface *si = appctx->owner;
 	struct connection *conn;
+
+	thread_isolate();
 
 	if (unlikely(si_ic(si)->flags & (CF_WRITE_ERROR|CF_SHUTW))) {
 		/* If we're forced to shut down, we might have to remove our
@@ -3052,7 +3083,7 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 				LIST_INIT(&appctx->ctx.sess.bref.users);
 			}
 		}
-		return 1;
+		goto done;
 	}
 
 	chunk_reset(&trash);
@@ -3067,14 +3098,11 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 		 * pointer points back to the head of the streams list.
 		 */
 		LIST_INIT(&appctx->ctx.sess.bref.users);
-		HA_SPIN_LOCK(STRMS_LOCK, &streams_lock);
 		appctx->ctx.sess.bref.ref = streams.n;
-		HA_SPIN_UNLOCK(STRMS_LOCK, &streams_lock);
 		appctx->st2 = STAT_ST_LIST;
 		/* fall through */
 
 	case STAT_ST_LIST:
-		HA_SPIN_LOCK(STRMS_LOCK, &streams_lock);
 		/* first, let's detach the back-ref from a possible previous stream */
 		if (!LIST_ISEMPTY(&appctx->ctx.sess.bref.users)) {
 			LIST_DEL(&appctx->ctx.sess.bref.users);
@@ -3094,10 +3122,8 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 
 				LIST_ADDQ(&curr_strm->back_refs, &appctx->ctx.sess.bref.users);
 				/* call the proper dump() function and return if we're missing space */
-				if (!stats_dump_full_strm_to_buffer(si, curr_strm)) {
-					HA_SPIN_UNLOCK(STRMS_LOCK, &streams_lock);
-					return 0;
-				}
+				if (!stats_dump_full_strm_to_buffer(si, curr_strm))
+					goto full;
 
 				/* stream dump complete */
 				LIST_DEL(&appctx->ctx.sess.bref.users);
@@ -3221,10 +3247,8 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 				/* let's try again later from this stream. We add ourselves into
 				 * this stream's users so that it can remove us upon termination.
 				 */
-				si_applet_cant_put(si);
 				LIST_ADDQ(&curr_strm->back_refs, &appctx->ctx.sess.bref.users);
-				HA_SPIN_UNLOCK(STRMS_LOCK, &streams_lock);
-				return 0;
+				goto full;
 			}
 
 		next_sess:
@@ -3238,26 +3262,26 @@ static int cli_io_handler_dump_sess(struct appctx *appctx)
 			else
 				chunk_appendf(&trash, "Session not found.\n");
 
-			if (ci_putchk(si_ic(si), &trash) == -1) {
-				si_applet_cant_put(si);
-				HA_SPIN_UNLOCK(STRMS_LOCK, &streams_lock);
-				return 0;
-			}
+			if (ci_putchk(si_ic(si), &trash) == -1)
+				goto full;
 
 			appctx->ctx.sess.target = NULL;
 			appctx->ctx.sess.uid = 0;
-			HA_SPIN_UNLOCK(STRMS_LOCK, &streams_lock);
-			return 1;
+			goto done;
 		}
-
-		HA_SPIN_UNLOCK(STRMS_LOCK, &streams_lock);
-		appctx->st2 = STAT_ST_FIN;
 		/* fall through */
 
 	default:
 		appctx->st2 = STAT_ST_FIN;
-		return 1;
+		goto done;
 	}
+ done:
+	thread_release();
+	return 1;
+ full:
+	thread_release();
+	si_applet_cant_put(si);
+	return 0;
 }
 
 static void cli_release_show_sess(struct appctx *appctx)

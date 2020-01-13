@@ -57,6 +57,7 @@
 #   DEP may be cleared to ignore changes to include files during development
 #   SMALL_OPTS may be used to specify some options to shrink memory usage.
 #   DEBUG may be used to set some internal debugging options.
+#   ERR may be set to non-empty to pass -Werror to the compiler
 #   ADDINC may be used to complete the include path in the form -Ipath.
 #   ADDLIB may be used to complete the library list in the form -Lpath -llib.
 #   DEFINE may be used to specify any additional define, which will be reported
@@ -96,13 +97,16 @@
 # Usage: CFLAGS += $(call cc-opt,option). Eg: $(call cc-opt,-fwrapv)
 # Note: ensure the referencing variable is assigned using ":=" and not "=" to
 #       call it only once.
-cc-opt = $(shell set -e; if $(CC) $(1) -c -xc - -o /dev/null </dev/null >&0 2>&0; then echo "$(1)"; fi;)
+cc-opt = $(shell set -e; if $(CC) $(1) -E -xc - -o /dev/null </dev/null >&0 2>&0; then echo "$(1)"; fi;)
+
+# same but emits $2 if $1 is not supported
+cc-opt-alt = $(shell set -e; if $(CC) $(1) -E -xc - -o /dev/null </dev/null >&0 2>&0; then echo "$(1)"; else echo "$(2)"; fi;)
 
 # Disable a warning when supported by the compiler. Don't put spaces around the
 # warning! And don't use cc-opt which doesn't always report an error until
 # another one is also returned.
 # Usage: CFLAGS += $(call cc-nowarn,warning). Eg: $(call cc-opt,format-truncation)
-cc-nowarn = $(shell set -e; if $(CC) -W$(1) -c -xc - -o /dev/null </dev/null >&0 2>&0; then echo "-Wno-$(1)"; fi;)
+cc-nowarn = $(shell set -e; if $(CC) -W$(1) -E -xc - -o /dev/null </dev/null >&0 2>&0; then echo "-Wno-$(1)"; fi;)
 
 #### Installation options.
 DESTDIR =
@@ -140,6 +144,9 @@ LD = $(CC)
 # Those flags only feed CFLAGS so it is not mandatory to use this form.
 DEBUG_CFLAGS = -g
 
+#### Add -Werror when set to non-empty
+ERR =
+
 #### Compiler-specific flags that may be used to disable some negative over-
 # optimization or to silence some warnings. -fno-strict-aliasing is needed with
 # gcc >= 4.4.
@@ -147,11 +154,12 @@ DEBUG_CFLAGS = -g
 # can do whatever it wants since it's an undefined behavior, so use -fwrapv
 # to be sure we get the intended behavior.
 SPEC_CFLAGS := -fno-strict-aliasing -Wdeclaration-after-statement
-SPEC_CFLAGS += $(call cc-opt,-fwrapv)
+SPEC_CFLAGS += $(call cc-opt-alt,-fwrapv,$(call cc-opt,-fno-strict-overflow))
 SPEC_CFLAGS += $(call cc-nowarn,format-truncation)
 SPEC_CFLAGS += $(call cc-nowarn,address-of-packed-member)
 SPEC_CFLAGS += $(call cc-nowarn,null-dereference)
 SPEC_CFLAGS += $(call cc-nowarn,unused-label)
+SPEC_CFLAGS += $(call cc-nowarn,stringop-overflow)
 
 #### Memory usage tuning
 # If small memory footprint is required, you can reduce the buffer size. There
@@ -324,12 +332,14 @@ ifeq ($(TARGET),freebsd)
   USE_TPROXY     = implicit
   USE_LIBCRYPT   = implicit
   USE_THREAD     = implicit
+  USE_CPU_AFFINITY= implicit
 else
 ifeq ($(TARGET),osx)
   # This is for Mac OS/X
   USE_POLL       = implicit
   USE_KQUEUE     = implicit
   USE_TPROXY     = implicit
+  EXPORT_SYMBOL  = -export_dynamic
 else
 ifeq ($(TARGET),openbsd)
   # This is for OpenBSD >= 5.7
@@ -349,7 +359,8 @@ ifeq ($(TARGET),aix51)
   # This is for AIX 5.1
   USE_POLL        = implicit
   USE_LIBCRYPT    = implicit
-  TARGET_CFLAGS   = -Dss_family=__ss_family
+  USE_PRIVATE_CACHE = implicit
+  TARGET_CFLAGS   = -Dss_family=__ss_family -Dip6_hdr=ip6hdr -DSTEVENS_API -D_LINUX_SOURCE_COMPAT -Dunsetenv=my_unsetenv
   DEBUG_CFLAGS    =
 else
 ifeq ($(TARGET),aix52)
@@ -413,10 +424,10 @@ endif
 # holding the same names in the current directory.
 
 ifeq ($(IGNOREGIT),)
-VERSION := $(shell [ -d .git/. ] && ref=`(git describe --tags --match 'v*' --abbrev=0) 2>/dev/null` && ref=$${ref%-g*} && echo "$${ref\#v}")
+VERSION := $(shell [ -d .git/. ] && (git describe --tags --match 'v*' --abbrev=0 | cut -c 2-) 2>/dev/null)
 ifneq ($(VERSION),)
 # OK git is there and works.
-SUBVERS := $(shell comms=`git log --format=oneline --no-merges v$(VERSION).. 2>/dev/null | wc -l | tr -dc '0-9'`; commit=`(git log -1 --pretty=%h --abbrev=6) 2>/dev/null`; [ $$comms -gt 0 ] && echo "-$$commit-$$comms")
+SUBVERS := $(shell comms=`git log --format=oneline --no-merges v$(VERSION).. 2>/dev/null | wc -l | tr -d '[:space:]'`; commit=`(git log -1 --pretty=%h --abbrev=6) 2>/dev/null`; [ $$comms -gt 0 ] && echo "-$$commit-$$comms")
 VERDATE := $(shell git log -1 --pretty=format:%ci | cut -f1 -d' ' | tr '-' '/')
 endif
 endif
@@ -629,7 +640,7 @@ check_lua_inc = $(shell if [ -d $(2)$(1) ]; then echo $(2)$(1); fi;)
 
 BUILD_OPTIONS   += $(call ignore_implicit,USE_LUA)
 OPTIONS_CFLAGS  += -DUSE_LUA $(if $(LUA_INC),-I$(LUA_INC))
-LUA_LD_FLAGS := -Wl,--export-dynamic $(if $(LUA_LIB),-L$(LUA_LIB))
+LUA_LD_FLAGS := -Wl,$(if $(EXPORT_SYMBOL),$(EXPORT_SYMBOL),--export-dynamic) $(if $(LUA_LIB),-L$(LUA_LIB))
 ifeq ($(LUA_LIB_NAME),)
 # Try to automatically detect the Lua library
 LUA_LIB_NAME := $(firstword $(foreach lib,lua5.3 lua53 lua,$(call check_lua_lib,$(lib),$(LUA_LD_FLAGS))))
@@ -802,6 +813,11 @@ EBTREE_DIR := ebtree
 #### Global compile options
 VERBOSE_CFLAGS = $(CFLAGS) $(TARGET_CFLAGS) $(SMALL_OPTS) $(DEFINE)
 COPTS  = -Iinclude -I$(EBTREE_DIR) -Wall
+
+ifneq ($(ERR),)
+COPTS += -Werror
+endif
+
 COPTS += $(CFLAGS) $(TARGET_CFLAGS) $(SMALL_OPTS) $(DEFINE) $(SILENT_DEFINE)
 COPTS += $(DEBUG) $(OPTIONS_CFLAGS) $(ADDINC)
 
@@ -891,7 +907,8 @@ INCLUDES = $(wildcard include/*/*.h ebtree/*.h)
 DEP = $(INCLUDES) .build_opts
 
 # Used only to force a rebuild if some build options change
-.build_opts: $(shell rm -f .build_opts.new; echo \'$(TARGET) $(BUILD_OPTIONS) $(VERBOSE_CFLAGS)\' > .build_opts.new; if cmp -s .build_opts .build_opts.new; then rm -f .build_opts.new; else mv -f .build_opts.new .build_opts; fi)
+build_opts = $(shell rm -f .build_opts.new; echo \'$(TARGET) $(BUILD_OPTIONS) $(VERBOSE_CFLAGS)\' > .build_opts.new; if cmp -s .build_opts .build_opts.new; then rm -f .build_opts.new; else mv -f .build_opts.new .build_opts; fi)
+.build_opts: $(build_opts)
 
 haproxy: $(OPTIONS_OBJS) $(EBTREE_OBJS) $(OBJS)
 	$(LD) $(LDFLAGS) -o $@ $^ $(LDOPTS)
@@ -993,3 +1010,20 @@ update-version:
 	echo "$(VERSION)" > VERSION
 	echo "$(SUBVERS)" > SUBVERS
 	echo "$(VERDATE)" > VERDATE
+
+# just display the build options
+opts:
+	@echo -n 'Using: '
+	@echo -n 'TARGET="$(strip $(TARGET))" '
+	@echo -n 'ARCH="$(strip $(ARCH))" '
+	@echo -n 'CPU="$(strip $(CPU))" '
+	@echo -n 'CC="$(strip $(CC))" '
+	@echo -n 'ARCH_FLAGS="$(strip $(ARCH_FLAGS))" '
+	@echo -n 'CPU_CFLAGS="$(strip $(CPU_CFLAGS))" '
+	@echo -n 'DEBUG_CFLAGS="$(strip $(DEBUG_CFLAGS))" '
+	@echo "$(strip $(BUILD_OPTIONS))"
+	@echo 'COPTS="$(strip $(COPTS))"'
+	@echo 'LDFLAGS="$(strip $(LDFLAGS))"'
+	@echo 'LDOPTS="$(strip $(LDOPTS))"'
+	@echo 'OPTIONS_OBJS="$(strip $(OPTIONS_OBJS))"'
+	@echo 'OBJS="$(strip $(OBJS))"'
