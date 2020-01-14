@@ -22,12 +22,14 @@
 !/tests
 !/debian
 !/scripts
+!/docker
 # Reject some generic files
 *.o
 *~
 *.rej
 *.orig
 *.bak
+*.tar.gz
 # And reject some specific files
 /contrib/base64/base64rev
 /contrib/halog/halog
