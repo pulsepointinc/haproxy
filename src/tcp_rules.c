@@ -163,6 +163,7 @@ resume_execution:
 				break;
 			}
 			else if (rule->action == ACT_ACTION_DENY) {
+				si_must_kill_conn(chn_prod(req));
 				channel_abort(req);
 				channel_abort(&s->res);
 				req->analysers = 0;
@@ -342,6 +343,7 @@ resume_execution:
 				break;
 			}
 			else if (rule->action == ACT_ACTION_DENY) {
+				si_must_kill_conn(chn_prod(rep));
 				channel_abort(rep);
 				channel_abort(&s->req);
 				rep->analysers = 0;
@@ -359,6 +361,7 @@ resume_execution:
 			}
 			else if (rule->action == ACT_TCP_CLOSE) {
 				chn_prod(rep)->flags |= SI_FL_NOLINGER | SI_FL_NOHALF;
+				si_must_kill_conn(chn_prod(rep));
 				si_shutr(chn_prod(rep));
 				si_shutw(chn_prod(rep));
 				break;
@@ -682,7 +685,7 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 			memprintf(err,
 			          "'%s %s %s' : fetch method '%s' extracts information from '%s', none of which is available here",
 			          args[0], args[1], args[kw], args[arg-1], sample_src_names(expr->fetch->use));
-			free(expr);
+			release_sample_expr(expr);
 			return -1;
 		}
 
@@ -692,7 +695,7 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 				memprintf(err,
 					  "'%s %s %s' : missing length value",
 					  args[0], args[1], args[kw]);
-				free(expr);
+				release_sample_expr(expr);
 				return -1;
 			}
 			/* we copy the table name for now, it will be resolved later */
@@ -701,7 +704,7 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 				memprintf(err,
 					  "'%s %s %s' : length must be > 0",
 					  args[0], args[1], args[kw]);
-				free(expr);
+				release_sample_expr(expr);
 				return -1;
 			}
 			arg++;
@@ -760,7 +763,7 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 			memprintf(err,
 			          "'%s %s %s' : fetch method '%s' extracts information from '%s', none of which is available here",
 			          args[0], args[1], args[kw], args[arg-1], sample_src_names(expr->fetch->use));
-			free(expr);
+			release_sample_expr(expr);
 			return -1;
 		}
 
@@ -773,7 +776,7 @@ static int tcp_parse_request_rule(char **args, int arg, int section_type,
 				memprintf(err,
 					  "'%s %s %s' : missing table name",
 					  args[0], args[1], args[kw]);
-				free(expr);
+				release_sample_expr(expr);
 				return -1;
 			}
 			/* we copy the table name for now, it will be resolved later */

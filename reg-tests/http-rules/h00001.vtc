@@ -38,6 +38,7 @@ server s1 {
 haproxy h1 -conf {
     defaults
 	mode http
+	${no-htx} option http-use-htx
 	timeout connect 1s
 	timeout client  1s
 	timeout server  1s
@@ -192,7 +193,6 @@ client c1h2 -connect ${h1_feh2_sock} {
 		txsettings
 		rxsettings
 		txsettings -ack
-		rxwinup
 		rxsettings
 		expect settings.ack == true
 	} -run

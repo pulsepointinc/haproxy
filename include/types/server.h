@@ -225,6 +225,8 @@ struct server {
 	unsigned int pool_purge_delay;          /* Delay before starting to purge the idle conns pool */
 	unsigned int max_idle_conns;            /* Max number of connection allowed in the orphan connections list */
 	unsigned int curr_idle_conns;           /* Current number of orphan idling connections */
+	unsigned int *curr_idle_thr;            /* Current number of orphan idling connections per thread */
+	int max_reuse;                          /* Max number of requests on a same connection */
 	struct task **idle_task;                /* task responsible for cleaning idle orphan connections */
 	struct task *warmup;                    /* the task dedicated to the warmup when slowstart is set */
 
@@ -315,7 +317,7 @@ struct server {
 	} ssl_ctx;
 #endif
 	struct dns_srvrq *srvrq;		/* Pointer representing the DNS SRV requeest, if any */
-	__decl_hathreads(HA_SPINLOCK_T lock);
+	__decl_hathreads(HA_SPINLOCK_T lock);   /* may enclose the proxy's lock, must not be taken under */
 	struct {
 		const char *file;		/* file where the section appears */
 		struct eb32_node id;		/* place in the tree of used IDs */

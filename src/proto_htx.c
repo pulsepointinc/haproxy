@@ -97,6 +97,14 @@ int htx_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 
 	htx = htxbuf(&req->buf);
 
+	/* Parsing errors are caught here */
+	if (htx->flags & HTX_FL_PARSING_ERROR) {
+		stream_inc_http_req_ctr(s);
+		stream_inc_http_err_ctr(s);
+		proxy_inc_fe_req_ctr(sess->fe);
+		goto return_bad_req;
+	}
+
 	/* we're speaking HTTP here, so let's speak HTTP to the client */
 	s->srv_error = http_return_srv_error;
 
@@ -126,9 +134,11 @@ int htx_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	 */
 	if (unlikely(htx_is_empty(htx) || htx_get_tail_type(htx) < HTX_BLK_EOH)) {
 		/*
-		 * First catch invalid request
+		 * First catch invalid request because only part of headers have
+		 * been transfered. Multiplexers have the responsibility to emit
+		 * all headers at once.
 		 */
-		if (htx->flags & HTX_FL_PARSING_ERROR) {
+		if (htx_is_not_empty(htx) || (s->si[0].flags & SI_FL_RXBLK_ROOM)) {
 			stream_inc_http_req_ctr(s);
 			stream_inc_http_err_ctr(s);
 			proxy_inc_fe_req_ctr(sess->fe);
@@ -309,7 +319,7 @@ int htx_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	if (sl->flags & HTX_SL_F_VER_11)
                 msg->flags |= HTTP_MSGF_VER_11;
 	msg->flags |= HTTP_MSGF_XFER_LEN;
-	msg->flags |= ((sl->flags & HTX_SL_F_CHNK) ? HTTP_MSGF_TE_CHNK : HTTP_MSGF_CNT_LEN);
+	msg->flags |= ((sl->flags & HTX_SL_F_CLEN) ? HTTP_MSGF_CNT_LEN : HTTP_MSGF_TE_CHNK);
 	if (sl->flags & HTX_SL_F_BODYLESS)
 		msg->flags |= HTTP_MSGF_BODYLESS;
 
@@ -327,7 +337,7 @@ int htx_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	 * the monitor-uri is defined by the frontend.
 	 */
 	if (unlikely((sess->fe->monitor_uri_len != 0) &&
-		     isteqi(htx_sl_req_uri(sl), ist2(sess->fe->monitor_uri, sess->fe->monitor_uri_len)))) {
+		     isteq(htx_sl_req_uri(sl), ist2(sess->fe->monitor_uri, sess->fe->monitor_uri_len)))) {
 		/*
 		 * We have found the monitor URI
 		 */
@@ -399,18 +409,8 @@ int htx_wait_for_request(struct stream *s, struct channel *req, int an_bit)
 	if (unlikely((s->logs.logwait & LW_REQHDR) && s->req_cap))
 		htx_capture_headers(htx, s->req_cap, sess->fe->req_cap);
 
-	/* Until set to anything else, the connection mode is set as Keep-Alive. It will
-	 * only change if both the request and the config reference something else.
-	 * Option httpclose by itself sets tunnel mode where headers are mangled.
-	 * However, if another mode is set, it will affect it (eg: server-close/
-	 * keep-alive + httpclose = close). Note that we avoid to redo the same work
-	 * if FE and BE have the same settings (common). The method consists in
-	 * checking if options changed between the two calls (implying that either
-	 * one is non-null, or one of them is non-null and we are there for the first
-	 * time.
-	 */
-	if ((sess->fe->options & PR_O_HTTP_MODE) != (s->be->options & PR_O_HTTP_MODE))
-		htx_adjust_conn_mode(s, txn);
+	/* by default, close the stream at the end of the transaction. */
+	txn->flags = (txn->flags & ~TX_CON_WANT_MSK) | TX_CON_WANT_CLO;
 
 	/* we may have to wait for the request's body */
 	if (s->be->options & PR_O_WREQ_BODY)
@@ -498,8 +498,10 @@ int htx_process_req_common(struct stream *s, struct channel *req, int an_bit, st
 
 	htx = htxbuf(&req->buf);
 
-	/* just in case we have some per-backend tracking */
-	stream_inc_be_http_req_ctr(s);
+	/* just in case we have some per-backend tracking. Only called the first
+	 * execution of the analyser. */
+	if (!s->current_rule || s->current_rule_list != &px->http_req_rules)
+		stream_inc_be_http_req_ctr(s);
 
 	/* evaluate http-request rules */
 	if (!LIST_ISEMPTY(&px->http_req_rules)) {
@@ -530,7 +532,7 @@ int htx_process_req_common(struct stream *s, struct channel *req, int an_bit, st
 	}
 
 	if (conn && (conn->flags & CO_FL_EARLY_DATA) &&
-	    (conn->flags & (CO_FL_EARLY_SSL_HS | CO_FL_HANDSHAKE))) {
+	    (conn->flags & (CO_FL_EARLY_SSL_HS | CO_FL_SSL_WAIT_HS))) {
 		struct http_hdr_ctx ctx;
 
 		ctx.blk = NULL;
@@ -665,7 +667,7 @@ int htx_process_req_common(struct stream *s, struct channel *req, int an_bit, st
 	 * If unset, then set it to zero because we really want it to
 	 * eventually expire. We build the tarpit as an analyser.
 	 */
-	channel_erase(&s->req);
+	channel_htx_erase(&s->req, htx);
 
 	/* wipe the request out so that we can drop the connection early
 	 * if the client closes first.
@@ -807,6 +809,7 @@ int htx_process_request(struct stream *s, struct channel *req, int an_bit)
 		 * insignificant.
 		 */
 		istcpy(&uri, (path.len ? path : ist("/")), uri.len);
+		conn->target = &s->be->obj_type;
 	}
 
 	/*
@@ -938,7 +941,8 @@ int htx_process_request(struct stream *s, struct channel *req, int an_bit)
 	 * that parameter. This will be done in another analyser.
 	 */
 	if (!(s->flags & (SF_ASSIGNED|SF_DIRECT)) &&
-	    s->txn->meth == HTTP_METH_POST && s->be->url_param_name != NULL) {
+	    s->txn->meth == HTTP_METH_POST &&
+	    (s->be->lbprm.algo & BE_LB_ALGO) == BE_LB_ALGO_PH) {
 		channel_dont_connect(req);
 		req->analysers |= AN_REQ_HTTP_BODY;
 	}
@@ -1010,8 +1014,7 @@ int htx_process_tarpit(struct stream *s, struct channel *req, int an_bit)
 	 */
 	s->logs.t_queue = tv_ms_elapsed(&s->logs.tv_accept, &now);
 
-	if (!(req->flags & CF_READ_ERROR))
-		htx_reply_and_close(s, txn->status, htx_error_message(s));
+	htx_reply_and_close(s, txn->status, (!(req->flags & CF_READ_ERROR) ? htx_error_message(s) : NULL));
 
 	req->analysers &= AN_REQ_FLT_END;
 	req->analyse_exp = TICK_ETERNITY;
@@ -1051,6 +1054,9 @@ int htx_wait_for_request_body(struct stream *s, struct channel *req, int an_bit)
 
 	htx = htxbuf(&req->buf);
 
+	if (htx->flags & HTX_FL_PARSING_ERROR)
+		goto return_bad_req;
+
 	if (msg->msg_state < HTTP_MSG_BODY)
 		goto missing_data;
 
@@ -1085,13 +1091,10 @@ int htx_wait_for_request_body(struct stream *s, struct channel *req, int an_bit)
 	 * been received or if the buffer is full.
 	 */
 	if (htx_get_tail_type(htx) >= HTX_BLK_EOD ||
-	    htx_used_space(htx) + global.tune.maxrewrite >= htx->size)
+	    channel_htx_full(req, htx, global.tune.maxrewrite))
 		goto http_end;
 
  missing_data:
-	if (htx->flags & HTX_FL_PARSING_ERROR)
-		goto return_bad_req;
-
 	if ((req->flags & CF_READ_TIMEOUT) || tick_is_expired(req->analyse_exp, now_ms)) {
 		txn->status = 408;
 		htx_reply_and_close(s, txn->status, htx_error_message(s));
@@ -1159,6 +1162,7 @@ int htx_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	struct http_txn *txn = s->txn;
 	struct http_msg *msg = &txn->req;
 	struct htx *htx;
+	short status = 0;
 	int ret;
 
 	DPRINTF(stderr,"[%u] %s: stream=%p b=%p, exp(r,w)=%u,%u bf=%08x bh=%lu analysers=%02x\n",
@@ -1215,8 +1219,14 @@ int htx_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 		goto missing_data_or_waiting;
 	}
 
-	if (msg->msg_state >= HTTP_MSG_DONE)
-		goto done;
+	if (msg->msg_state >= HTTP_MSG_ENDING)
+		goto ending;
+
+	if (txn->meth == HTTP_METH_CONNECT) {
+		msg->msg_state = HTTP_MSG_ENDING;
+		goto ending;
+	}
+
 	/* Forward input data. We get it by removing all outgoing data not
 	 * forwarded yet from HTX data size. If there are some data filters, we
 	 * let them decide the amount of data to forward.
@@ -1226,8 +1236,6 @@ int htx_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 		if (ret < 0)
 			goto return_bad_req;
 		c_adv(req, ret);
-		if (htx->data != co_data(req) || htx->extra)
-			goto missing_data_or_waiting;
 	}
 	else {
 		c_adv(req, htx->data - co_data(req));
@@ -1241,19 +1249,22 @@ int htx_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 			htx->extra -= channel_htx_forward(req, htx, htx->extra);
 	}
 
+	if (htx->data != co_data(req))
+		goto missing_data_or_waiting;
+
 	/* Check if the end-of-message is reached and if so, switch the message
-	 * in HTTP_MSG_DONE state.
+	 * in HTTP_MSG_ENDING state. Then if all data was marked to be
+	 * forwarded, set the state to HTTP_MSG_DONE.
 	 */
 	if (htx_get_tail_type(htx) != HTX_BLK_EOM)
 		goto missing_data_or_waiting;
 
-	msg->msg_state = HTTP_MSG_DONE;
+	msg->msg_state = HTTP_MSG_ENDING;
 
-  done:
-	/* other states, DONE...TUNNEL */
-	/* we don't want to forward closes on DONE except in tunnel mode. */
-	if ((txn->flags & TX_CON_WANT_MSK) != TX_CON_WANT_TUN)
-		channel_dont_close(req);
+  ending:
+	/* other states, ENDING...TUNNEL */
+	if (msg->msg_state >= HTTP_MSG_DONE)
+		goto done;
 
 	if (HAS_REQ_DATA_FILTERS(s)) {
 		ret = flt_http_end(s, msg);
@@ -1264,6 +1275,18 @@ int htx_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 		}
 	}
 
+	if (txn->meth == HTTP_METH_CONNECT)
+		msg->msg_state = HTTP_MSG_TUNNEL;
+	else {
+		msg->msg_state = HTTP_MSG_DONE;
+		req->to_forward = 0;
+	}
+
+  done:
+	/* we don't want to forward closes on DONE except in tunnel mode. */
+	if ((txn->flags & TX_CON_WANT_MSK) != TX_CON_WANT_TUN)
+		channel_dont_close(req);
+
 	htx_end_request(s);
 	if (!(req->analysers & an_bit)) {
 		htx_end_response(s);
@@ -1271,7 +1294,7 @@ int htx_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 			if (req->flags & CF_SHUTW) {
 				/* request errors are most likely due to the
 				 * server aborting the transfer. */
-				goto aborted_xfer;
+				goto return_srv_abort;
 			}
 			goto return_bad_req;
 		}
@@ -1283,7 +1306,7 @@ int htx_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 	 * server, which will decide whether to close or to go on processing the
 	 * request. We only do that in tunnel mode, and not in other modes since
 	 * it can be abused to exhaust source ports. */
-	if ((s->be->options & PR_O_ABRT_CLOSE) && !(s->si[0].flags & SI_FL_CLEAN_ABRT)) {
+	if (s->be->options & PR_O_ABRT_CLOSE) {
 		channel_auto_read(req);
 		if ((req->flags & (CF_SHUTR|CF_READ_NULL)) &&
 		    ((txn->flags & TX_CON_WANT_MSK) != TX_CON_WANT_TUN))
@@ -1300,28 +1323,13 @@ int htx_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 
  missing_data_or_waiting:
 	/* stop waiting for data if the input is closed before the end */
-	if (msg->msg_state < HTTP_MSG_DONE && req->flags & CF_SHUTR) {
-		if (!(s->flags & SF_ERR_MASK))
-			s->flags |= SF_ERR_CLICL;
-		if (!(s->flags & SF_FINST_MASK)) {
-			if (txn->rsp.msg_state < HTTP_MSG_ERROR)
-				s->flags |= SF_FINST_H;
-			else
-				s->flags |= SF_FINST_D;
-		}
-
-		HA_ATOMIC_ADD(&sess->fe->fe_counters.cli_aborts, 1);
-		HA_ATOMIC_ADD(&s->be->be_counters.cli_aborts, 1);
-		if (objt_server(s->target))
-			HA_ATOMIC_ADD(&objt_server(s->target)->counters.cli_aborts, 1);
-
-		goto return_bad_req_stats_ok;
-	}
+	if (msg->msg_state < HTTP_MSG_ENDING && req->flags & CF_SHUTR)
+		goto return_cli_abort;
 
  waiting:
 	/* waiting for the last bits to leave the buffer */
 	if (req->flags & CF_SHUTW)
-		goto aborted_xfer;
+		goto return_srv_abort;
 
 	if (htx->flags & HTX_FL_PARSING_ERROR)
 		goto return_bad_req;
@@ -1350,60 +1358,48 @@ int htx_request_forward_body(struct stream *s, struct channel *req, int an_bit)
 
 	return 0;
 
- return_bad_req: /* let's centralize all bad requests */
-	HA_ATOMIC_ADD(&sess->fe->fe_counters.failed_req, 1);
-	if (sess->listener->counters)
-		HA_ATOMIC_ADD(&sess->listener->counters->failed_req, 1);
-
- return_bad_req_stats_ok:
-	txn->req.err_state = txn->req.msg_state;
-	txn->req.msg_state = HTTP_MSG_ERROR;
-	if (txn->status > 0) {
-		/* Note: we don't send any error if some data were already sent */
-		htx_reply_and_close(s, txn->status, NULL);
-	} else {
-		txn->status = 400;
-		htx_reply_and_close(s, txn->status, htx_error_message(s));
-	}
-	req->analysers   &= AN_REQ_FLT_END;
-	s->res.analysers &= AN_RES_FLT_END; /* we're in data phase, we want to abort both directions */
-
+  return_cli_abort:
+	HA_ATOMIC_ADD(&sess->fe->fe_counters.cli_aborts, 1);
+	HA_ATOMIC_ADD(&s->be->be_counters.cli_aborts, 1);
+	if (objt_server(s->target))
+		HA_ATOMIC_ADD(&objt_server(s->target)->counters.cli_aborts, 1);
 	if (!(s->flags & SF_ERR_MASK))
-		s->flags |= SF_ERR_PRXCOND;
-	if (!(s->flags & SF_FINST_MASK)) {
-		if (txn->rsp.msg_state < HTTP_MSG_ERROR)
-			s->flags |= SF_FINST_H;
-		else
-			s->flags |= SF_FINST_D;
-	}
-	return 0;
+		s->flags |= SF_ERR_CLICL;
+	status = 400;
+	goto return_error;
 
- aborted_xfer:
-	txn->req.err_state = txn->req.msg_state;
-	txn->req.msg_state = HTTP_MSG_ERROR;
-	if (txn->status > 0) {
-		/* Note: we don't send any error if some data were already sent */
-		htx_reply_and_close(s, txn->status, NULL);
-	} else {
-		txn->status = 502;
-		htx_reply_and_close(s, txn->status, htx_error_message(s));
-	}
-	req->analysers   &= AN_REQ_FLT_END;
-	s->res.analysers &= AN_RES_FLT_END; /* we're in data phase, we want to abort both directions */
-
+  return_srv_abort:
 	HA_ATOMIC_ADD(&sess->fe->fe_counters.srv_aborts, 1);
 	HA_ATOMIC_ADD(&s->be->be_counters.srv_aborts, 1);
 	if (objt_server(s->target))
 		HA_ATOMIC_ADD(&objt_server(s->target)->counters.srv_aborts, 1);
-
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_SRVCL;
-	if (!(s->flags & SF_FINST_MASK)) {
-		if (txn->rsp.msg_state < HTTP_MSG_ERROR)
-			s->flags |= SF_FINST_H;
-		else
-			s->flags |= SF_FINST_D;
+	status = 502;
+	goto return_error;
+
+  return_bad_req:
+	HA_ATOMIC_ADD(&sess->fe->fe_counters.failed_req, 1);
+	if (sess->listener->counters)
+		HA_ATOMIC_ADD(&sess->listener->counters->failed_req, 1);
+	if (!(s->flags & SF_ERR_MASK))
+		s->flags |= SF_ERR_CLICL;
+	status = 400;
+
+  return_error:
+	txn->req.err_state = txn->req.msg_state;
+	txn->req.msg_state = HTTP_MSG_ERROR;
+	if (txn->status > 0) {
+		/* Note: we don't send any error if some data were already sent */
+		htx_reply_and_close(s, txn->status, NULL);
+	} else {
+		txn->status = status;
+		htx_reply_and_close(s, txn->status, htx_error_message(s));
 	}
+	req->analysers   &= AN_REQ_FLT_END;
+	s->res.analysers &= AN_RES_FLT_END; /* we're in data phase, we want to abort both directions */
+	if (!(s->flags & SF_FINST_MASK))
+		s->flags |= ((txn->rsp.msg_state < HTTP_MSG_ERROR) ? SF_FINST_H : SF_FINST_D);
 	return 0;
 }
 
@@ -1442,6 +1438,10 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 	htx = htxbuf(&rep->buf);
 
+	/* Parsing errors are caught here */
+	if (htx->flags & HTX_FL_PARSING_ERROR)
+		goto return_bad_res;
+
 	/*
 	 * Now we quickly check if we have found a full valid response.
 	 * If not so, we check the FD and buffer states before leaving.
@@ -1456,9 +1456,13 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	 */
 	if (unlikely(co_data(rep) || htx_is_empty(htx) || htx_get_tail_type(htx) < HTX_BLK_EOH)) {
 		/*
-		 * First catch invalid response
+		 * First catch invalid response because of a parsing error or
+		 * because only part of headers have been transfered.
+		 * Multiplexers have the responsibility to emit all headers at
+		 * once. We must be sure to have forwarded all outgoing data
+		 * first.
 		 */
-		if (htx->flags & HTX_FL_PARSING_ERROR)
+		if (!co_data(rep) && (htx_is_not_empty(htx) || (s->si[1].flags & SI_FL_RXBLK_ROOM)))
 			goto return_bad_res;
 
 		/* 1: have we encountered a read error ? */
@@ -1473,6 +1477,8 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 			}
 
 			rep->analysers &= AN_RES_FLT_END;
+			s->req.analysers &= AN_REQ_FLT_END;
+			rep->analyse_exp = TICK_ETERNITY;
 			txn->status = 502;
 
 			/* Check to see if the server refused the early data.
@@ -1504,6 +1510,8 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 			}
 
 			rep->analysers &= AN_RES_FLT_END;
+			s->req.analysers &= AN_REQ_FLT_END;
+			rep->analyse_exp = TICK_ETERNITY;
 			txn->status = 504;
 			s->si[1].flags |= SI_FL_NOLINGER;
 			htx_reply_and_close(s, txn->status, htx_error_message(s));
@@ -1523,6 +1531,8 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 				HA_ATOMIC_ADD(&__objt_server(s->target)->counters.cli_aborts, 1);
 
 			rep->analysers &= AN_RES_FLT_END;
+			s->req.analysers &= AN_REQ_FLT_END;
+			rep->analyse_exp = TICK_ETERNITY;
 			txn->status = 400;
 			htx_reply_and_close(s, txn->status, htx_error_message(s));
 
@@ -1547,6 +1557,8 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 			}
 
 			rep->analysers &= AN_RES_FLT_END;
+			s->req.analysers &= AN_REQ_FLT_END;
+			rep->analyse_exp = TICK_ETERNITY;
 			txn->status = 502;
 			s->si[1].flags |= SI_FL_NOLINGER;
 			htx_reply_and_close(s, txn->status, htx_error_message(s));
@@ -1565,6 +1577,8 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 
 			HA_ATOMIC_ADD(&s->be->be_counters.failed_resp, 1);
 			rep->analysers &= AN_RES_FLT_END;
+			s->req.analysers &= AN_REQ_FLT_END;
+			rep->analyse_exp = TICK_ETERNITY;
 
 			if (!(s->flags & SF_ERR_MASK))
 				s->flags |= SF_ERR_CLICL;
@@ -1584,7 +1598,6 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	 * response which at least looks like HTTP. We have an indicator
 	 * of each header's length, so we can parse them quickly.
 	 */
-
 	msg->msg_state = HTTP_MSG_BODY;
 	sl = http_find_stline(htx);
 
@@ -1616,7 +1629,7 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
                 msg->flags |= HTTP_MSGF_VER_11;
 	if (sl->flags & HTX_SL_F_XFER_LEN) {
 		msg->flags |= HTTP_MSGF_XFER_LEN;
-		msg->flags |= ((sl->flags & HTX_SL_F_CHNK) ? HTTP_MSGF_TE_CHNK : HTTP_MSGF_CNT_LEN);
+		msg->flags |= ((sl->flags & HTX_SL_F_CLEN) ? HTTP_MSGF_CNT_LEN : HTTP_MSGF_TE_CHNK);
 		if (sl->flags & HTX_SL_F_BODYLESS)
 			msg->flags |= HTTP_MSGF_BODYLESS;
 	}
@@ -1656,9 +1669,19 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	 */
 	if (txn->status < 200 &&
 	    (txn->status == 100 || txn->status >= 102)) {
+		int32_t pos;
+
 		FLT_STRM_CB(s, flt_http_reset(s, msg));
-		c_adv(rep, htx->data);
+		for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
+			struct htx_blk *blk = htx_get_blk(htx, pos);
+			enum htx_blk_type type = htx_get_blk_type(blk);
+
+			c_adv(rep, htx_get_blksz(blk));
+			if (type == HTX_BLK_EOM)
+				break;
+		}
 		msg->msg_state = HTTP_MSG_RPBEFORE;
+		msg->flags = 0;
 		txn->status = 0;
 		s->logs.t_data = -1; /* was not a response yet */
 		return 0;
@@ -1736,8 +1759,10 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 		ctx.blk = NULL;
 		while (http_find_header(htx, hdr, &ctx, 0)) {
 			if ((ctx.value.len >= 9 && word_match(ctx.value.ptr, ctx.value.len, "Negotiate", 9)) ||
-			    (ctx.value.len >= 4 && word_match(ctx.value.ptr, ctx.value.len, "NTLM", 4)))
+			    (ctx.value.len >= 4 && word_match(ctx.value.ptr, ctx.value.len, "NTLM", 4))) {
+				sess->flags |= SESS_FL_PREFER_LAST;
 				srv_conn->flags |= CO_FL_PRIVATE;
+			}
 		}
 	}
 
@@ -1761,6 +1786,8 @@ int htx_wait_for_response(struct stream *s, struct channel *rep, int an_bit)
 	s->si[1].flags |= SI_FL_NOLINGER;
 	htx_reply_and_close(s, txn->status, htx_error_message(s));
 	rep->analysers &= AN_RES_FLT_END;
+	s->req.analysers &= AN_REQ_FLT_END;
+	rep->analyse_exp = TICK_ETERNITY;
 
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_PRXCOND;
@@ -1991,6 +2018,9 @@ int htx_process_res_common(struct stream *s, struct channel *rep, int an_bit, st
 		if (s->be->ck_opts & PR_CK_SECURE)
 			chunk_appendf(&trash, "; Secure");
 
+		if (s->be->cookie_attrs)
+			chunk_appendf(&trash, "; %s", s->be->cookie_attrs);
+
 		if (unlikely(!http_add_header(htx, ist("Set-Cookie"), ist2(trash.area, trash.data))))
 			goto return_bad_resp;
 
@@ -2077,6 +2107,9 @@ int htx_process_res_common(struct stream *s, struct channel *rep, int an_bit, st
 		s->flags |= SF_ERR_PRXCOND;
 	if (!(s->flags & SF_FINST_MASK))
 		s->flags |= SF_FINST_H;
+
+	s->req.analysers &= AN_REQ_FLT_END;
+	rep->analyse_exp = TICK_ETERNITY;
 	return 0;
 }
 
@@ -2152,8 +2185,14 @@ int htx_response_forward_body(struct stream *s, struct channel *res, int an_bit)
 		goto missing_data_or_waiting;
 	}
 
-	if (msg->msg_state >= HTTP_MSG_DONE)
-		goto done;
+	if (msg->msg_state >= HTTP_MSG_ENDING)
+		goto ending;
+
+	if ((txn->meth == HTTP_METH_CONNECT && txn->status == 200) || txn->status == 101 ||
+	    (!(msg->flags & HTTP_MSGF_XFER_LEN) && !HAS_RSP_DATA_FILTERS(s))) {
+		msg->msg_state = HTTP_MSG_ENDING;
+		goto ending;
+	}
 
 	/* Forward input data. We get it by removing all outgoing data not
 	 * forwarded yet from HTX data size. If there are some data filters, we
@@ -2164,8 +2203,6 @@ int htx_response_forward_body(struct stream *s, struct channel *res, int an_bit)
 		if (ret < 0)
 			goto return_bad_res;
 		c_adv(res, ret);
-		if (htx->data != co_data(res) || htx->extra)
-			goto missing_data_or_waiting;
 	}
 	else {
 		c_adv(res, htx->data - co_data(res));
@@ -2179,25 +2216,27 @@ int htx_response_forward_body(struct stream *s, struct channel *res, int an_bit)
 			htx->extra -= channel_htx_forward(res, htx, htx->extra);
 	}
 
-	if (!(msg->flags & HTTP_MSGF_XFER_LEN)) {
-		/* The server still sending data that should be filtered */
-		if (res->flags & CF_SHUTR || !HAS_RSP_DATA_FILTERS(s)) {
-			msg->msg_state = HTTP_MSG_TUNNEL;
-			goto done;
-		}
+	if (htx->data != co_data(res))
+		goto missing_data_or_waiting;
+
+	if (!(msg->flags & HTTP_MSGF_XFER_LEN) && res->flags & CF_SHUTR) {
+		msg->msg_state = HTTP_MSG_ENDING;
+		goto ending;
 	}
 
 	/* Check if the end-of-message is reached and if so, switch the message
-	 * in HTTP_MSG_DONE state.
+	 * in HTTP_MSG_ENDING state. Then if all data was marked to be
+	 * forwarded, set the state to HTTP_MSG_DONE.
 	 */
 	if (htx_get_tail_type(htx) != HTX_BLK_EOM)
 		goto missing_data_or_waiting;
 
-	msg->msg_state = HTTP_MSG_DONE;
+	msg->msg_state = HTTP_MSG_ENDING;
 
-  done:
-	/* other states, DONE...TUNNEL */
-	channel_dont_close(res);
+  ending:
+	/* other states, ENDING...TUNNEL */
+	if (msg->msg_state >= HTTP_MSG_DONE)
+		goto done;
 
 	if (HAS_RSP_DATA_FILTERS(s)) {
 		ret = flt_http_end(s, msg);
@@ -2208,6 +2247,20 @@ int htx_response_forward_body(struct stream *s, struct channel *res, int an_bit)
 		}
 	}
 
+	if ((txn->meth == HTTP_METH_CONNECT && txn->status == 200) || txn->status == 101 ||
+	    !(msg->flags & HTTP_MSGF_XFER_LEN)) {
+		msg->msg_state = HTTP_MSG_TUNNEL;
+		goto ending;
+	}
+	else {
+		msg->msg_state = HTTP_MSG_DONE;
+		res->to_forward = 0;
+	}
+
+  done:
+
+	channel_dont_close(res);
+
 	htx_end_response(s);
 	if (!(res->analysers & an_bit)) {
 		htx_end_request(s);
@@ -2215,7 +2268,7 @@ int htx_response_forward_body(struct stream *s, struct channel *res, int an_bit)
 			if (res->flags & CF_SHUTW) {
 				/* response errors are most likely due to the
 				 * client aborting the transfer. */
-				goto aborted_xfer;
+				goto return_cli_abort;
 			}
 			goto return_bad_res;
 		}
@@ -2225,7 +2278,7 @@ int htx_response_forward_body(struct stream *s, struct channel *res, int an_bit)
 
   missing_data_or_waiting:
 	if (res->flags & CF_SHUTW)
-		goto aborted_xfer;
+		goto return_cli_abort;
 
 	if (htx->flags & HTX_FL_PARSING_ERROR)
 		goto return_bad_res;
@@ -2235,18 +2288,12 @@ int htx_response_forward_body(struct stream *s, struct channel *res, int an_bit)
 	 * so we don't want to count this as a server abort. Otherwise it's a
 	 * server abort.
 	 */
-	if (msg->msg_state < HTTP_MSG_DONE && res->flags & CF_SHUTR) {
+	if (msg->msg_state < HTTP_MSG_ENDING && res->flags & CF_SHUTR) {
 		if ((s->req.flags & (CF_SHUTR|CF_SHUTW)) == (CF_SHUTR|CF_SHUTW))
-			goto aborted_xfer;
+			goto return_cli_abort;
 		/* If we have some pending data, we continue the processing */
-		if (htx_is_empty(htx)) {
-			if (!(s->flags & SF_ERR_MASK))
-				s->flags |= SF_ERR_SRVCL;
-			HA_ATOMIC_ADD(&s->be->be_counters.srv_aborts, 1);
-			if (objt_server(s->target))
-				HA_ATOMIC_ADD(&objt_server(s->target)->counters.srv_aborts, 1);
-			goto return_bad_res_stats_ok;
-		}
+		if (htx_is_empty(htx))
+			goto return_srv_abort;
 	}
 
 	/* When TE: chunked is used, we need to get there again to parse
@@ -2272,57 +2319,43 @@ int htx_response_forward_body(struct stream *s, struct channel *res, int an_bit)
 	/* the stream handler will take care of timeouts and errors */
 	return 0;
 
- return_bad_res: /* let's centralize all bad responses */
-	HA_ATOMIC_ADD(&s->be->be_counters.failed_resp, 1);
+  return_srv_abort:
+	HA_ATOMIC_ADD(&sess->fe->fe_counters.srv_aborts, 1);
+	HA_ATOMIC_ADD(&s->be->be_counters.srv_aborts, 1);
 	if (objt_server(s->target))
-		HA_ATOMIC_ADD(&objt_server(s->target)->counters.failed_resp, 1);
-
- return_bad_res_stats_ok:
-	txn->rsp.err_state = txn->rsp.msg_state;
-	txn->rsp.msg_state = HTTP_MSG_ERROR;
-	/* don't send any error message as we're in the body */
-	htx_reply_and_close(s, txn->status, NULL);
-	res->analysers   &= AN_RES_FLT_END;
-	s->req.analysers &= AN_REQ_FLT_END; /* we're in data phase, we want to abort both directions */
-	if (objt_server(s->target))
-		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_HDRRSP);
-
+		HA_ATOMIC_ADD(&objt_server(s->target)->counters.srv_aborts, 1);
 	if (!(s->flags & SF_ERR_MASK))
-		s->flags |= SF_ERR_PRXCOND;
-	if (!(s->flags & SF_FINST_MASK))
-		s->flags |= SF_FINST_D;
-	return 0;
+		s->flags |= SF_ERR_SRVCL;
+	goto return_error;
 
- aborted_xfer:
-	txn->rsp.err_state = txn->rsp.msg_state;
-	txn->rsp.msg_state = HTTP_MSG_ERROR;
-	/* don't send any error message as we're in the body */
-	htx_reply_and_close(s, txn->status, NULL);
-	res->analysers   &= AN_RES_FLT_END;
-	s->req.analysers &= AN_REQ_FLT_END; /* we're in data phase, we want to abort both directions */
-
+  return_cli_abort:
 	HA_ATOMIC_ADD(&sess->fe->fe_counters.cli_aborts, 1);
 	HA_ATOMIC_ADD(&s->be->be_counters.cli_aborts, 1);
 	if (objt_server(s->target))
 		HA_ATOMIC_ADD(&objt_server(s->target)->counters.cli_aborts, 1);
-
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_CLICL;
+	goto return_error;
+
+  return_bad_res:
+	HA_ATOMIC_ADD(&s->be->be_counters.failed_resp, 1);
+	if (objt_server(s->target)) {
+		HA_ATOMIC_ADD(&objt_server(s->target)->counters.failed_resp, 1);
+		health_adjust(__objt_server(s->target), HANA_STATUS_HTTP_RSP);
+	}
+	if (!(s->flags & SF_ERR_MASK))
+		s->flags |= SF_ERR_SRVCL;
+
+   return_error:
+	txn->rsp.err_state = txn->rsp.msg_state;
+	txn->rsp.msg_state = HTTP_MSG_ERROR;
+	/* don't send any error message as we're in the body */
+	htx_reply_and_close(s, txn->status, NULL);
+	res->analysers   &= AN_RES_FLT_END;
+	s->req.analysers &= AN_REQ_FLT_END; /* we're in data phase, we want to abort both directions */
 	if (!(s->flags & SF_FINST_MASK))
 		s->flags |= SF_FINST_D;
 	return 0;
-}
-
-void htx_adjust_conn_mode(struct stream *s, struct http_txn *txn)
-{
-	struct proxy *fe = strm_fe(s);
-	int tmp = TX_CON_WANT_CLO;
-
-	if ((fe->options & PR_O_HTTP_MODE) == PR_O_HTTP_TUN)
-		tmp = TX_CON_WANT_TUN;
-
-	if ((txn->flags & TX_CON_WANT_MSK) < tmp)
-		txn->flags = (txn->flags & ~TX_CON_WANT_MSK) | tmp;
 }
 
 /* Perform an HTTP redirect based on the information in <rule>. The function
@@ -2499,6 +2532,8 @@ int htx_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struct
 	}
 
 	htx = htx_from_buf(&res->buf);
+	/* Trim any possible response */
+	channel_htx_truncate(&s->res, htx);
 	flags = (HTX_SL_F_IS_RESP|HTX_SL_F_VER_11|HTX_SL_F_XFER_LEN|HTX_SL_F_BODYLESS);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, ist("HTTP/1.1"), status, reason);
 	if (!sl)
@@ -2524,8 +2559,7 @@ int htx_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struct
 	if (!htx_add_endof(htx, HTX_BLK_EOH) || !htx_add_endof(htx, HTX_BLK_EOM))
 		goto fail;
 
-	/* let's log the request time */
-	s->logs.tv_request = now;
+	htx_to_buf(htx, &res->buf);
 
 	data = htx->data - co_data(res);
 	c_adv(res, data);
@@ -2534,19 +2568,25 @@ int htx_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struct
 	channel_auto_read(req);
 	channel_abort(req);
 	channel_auto_close(req);
-	channel_erase(req);
+	channel_htx_erase(req, htxbuf(&req->buf));
 
 	res->wex = tick_add_ifset(now_ms, res->wto);
 	channel_auto_read(res);
 	channel_auto_close(res);
 	channel_shutr_now(res);
+	if (rule->flags & REDIRECT_FLAG_FROM_REQ) {
+		/* let's log the request time */
+		s->logs.tv_request = now;
+		req->analysers &= AN_REQ_FLT_END;
 
-	req->analysers &= AN_REQ_FLT_END;
+		if (s->sess->fe == s->be) /* report it if the request was intercepted by the frontend */
+			HA_ATOMIC_ADD(&s->sess->fe->fe_counters.intercepted_req, 1);
+	}
 
 	if (!(s->flags & SF_ERR_MASK))
 		s->flags |= SF_ERR_LOCAL;
 	if (!(s->flags & SF_FINST_MASK))
-		s->flags |= SF_FINST_R;
+		s->flags |= ((rule->flags & REDIRECT_FLAG_FROM_REQ) ? SF_FINST_R : SF_FINST_H);
 
 	free_trash_chunk(chunk);
 	return 1;
@@ -2554,7 +2594,7 @@ int htx_apply_redirect_rule(struct redirect_rule *rule, struct stream *s, struct
   fail:
 	/* If an error occurred, remove the incomplete HTTP response from the
 	 * buffer */
-	channel_truncate(res);
+	channel_htx_truncate(res, htxbuf(&res->buf));
 	free_trash_chunk(chunk);
 	return 0;
 }
@@ -2614,7 +2654,7 @@ static int htx_reply_103_early_hints(struct channel *res)
 		/* If an error occurred during an Early-hint rule,
 		 * remove the incomplete HTTP 103 response from the
 		 * buffer */
-		channel_truncate(res);
+		channel_htx_truncate(res, htx);
 		return -1;
 	}
 
@@ -2660,7 +2700,7 @@ static int htx_add_early_hint_header(struct stream *s, int early_hints, const st
   fail:
 	/* If an error occurred during an Early-hint rule, remove the incomplete
 	 * HTTP 103 response from the buffer */
-	channel_truncate(res);
+	channel_htx_truncate(res, htx);
 	free_trash_chunk(value);
 	return -1;
 }
@@ -3010,13 +3050,14 @@ static enum rule_result htx_req_get_intercept_rule(struct proxy *px, struct list
 				value->area[value->data] = '\0';
 
 				/* perform update */
+				HA_SPIN_LOCK(PATREF_LOCK, &ref->lock);
 				if (pat_ref_find_elt(ref, key->area) != NULL)
 					/* update entry if it exists */
 					pat_ref_set(ref, key->area, value->area, NULL);
 				else
 					/* insert a new entry */
 					pat_ref_add(ref, key->area, value->area, NULL);
-
+				HA_SPIN_UNLOCK(PATREF_LOCK, &ref->lock);
 				free_trash_chunk(key);
 				free_trash_chunk(value);
 				break;
@@ -3037,7 +3078,6 @@ static enum rule_result htx_req_get_intercept_rule(struct proxy *px, struct list
 			case ACT_CUSTOM:
 				if ((s->req.flags & CF_READ_ERROR) ||
 				    ((s->req.flags & (CF_SHUTR|CF_READ_NULL)) &&
-				     !(s->si[0].flags & SI_FL_CLEAN_ABRT) &&
 				     (px->options & PR_O_ABRT_CLOSE)))
 					act_flags |= ACT_FLAG_FINAL;
 
@@ -3306,9 +3346,10 @@ resume_execution:
 
 				/* perform update */
 				/* check if the entry already exists */
+				HA_SPIN_LOCK(PATREF_LOCK, &ref->lock);
 				if (pat_ref_find_elt(ref, key->area) == NULL)
 					pat_ref_add(ref, key->area, NULL, NULL);
-
+				HA_SPIN_UNLOCK(PATREF_LOCK, &ref->lock);
 				free_trash_chunk(key);
 				break;
 			}
@@ -3427,7 +3468,6 @@ resume_execution:
 			case ACT_CUSTOM:
 				if ((s->req.flags & CF_READ_ERROR) ||
 				    ((s->req.flags & (CF_SHUTR|CF_READ_NULL)) &&
-				     !(s->si[0].flags & SI_FL_CLEAN_ABRT) &&
 				     (px->options & PR_O_ABRT_CLOSE)))
 					act_flags |= ACT_FLAG_FINAL;
 
@@ -3493,7 +3533,7 @@ static int htx_apply_filter_to_req_headers(struct stream *s, struct channel *req
 		n = htx_get_blk_name(htx, blk);
 		v = htx_get_blk_value(htx, blk);
 
-		chunk_memcat(hdr, n.ptr, n.len);
+		chunk_memcpy(hdr, n.ptr, n.len);
 		hdr->area[hdr->data++] = ':';
 		hdr->area[hdr->data++] = ' ';
 		chunk_memcat(hdr, v.ptr, v.len);
@@ -3525,6 +3565,7 @@ static int htx_apply_filter_to_req_headers(struct stream *s, struct channel *req
 					http_parse_header(ist2(trash.area, len), &n, &v);
 					ctx.blk = blk;
 					ctx.value = v;
+				        ctx.lws_before = ctx.lws_after = 0;
 					if (!http_replace_header(htx, &ctx, n, v))
 						return -1;
 					if (!ctx.blk)
@@ -3535,6 +3576,7 @@ static int htx_apply_filter_to_req_headers(struct stream *s, struct channel *req
 				case ACT_REMOVE:
 					ctx.blk = blk;
 					ctx.value = v;
+				        ctx.lws_before = ctx.lws_after = 0;
 					if (!http_remove_header(htx, &ctx))
 						return -1;
 					if (!ctx.blk)
@@ -3708,7 +3750,7 @@ static int htx_apply_filter_to_resp_headers(struct stream *s, struct channel *re
 		n = htx_get_blk_name(htx, blk);
 		v = htx_get_blk_value(htx, blk);
 
-		chunk_memcat(hdr, n.ptr, n.len);
+		chunk_memcpy(hdr, n.ptr, n.len);
 		hdr->area[hdr->data++] = ':';
 		hdr->area[hdr->data++] = ' ';
 		chunk_memcat(hdr, v.ptr, v.len);
@@ -3738,6 +3780,7 @@ static int htx_apply_filter_to_resp_headers(struct stream *s, struct channel *re
 					http_parse_header(ist2(trash.area, len), &n, &v);
 					ctx.blk = blk;
 					ctx.value = v;
+				        ctx.lws_before = ctx.lws_after = 0;
 					if (!http_replace_header(htx, &ctx, n, v))
 						return -1;
 					if (!ctx.blk)
@@ -3748,6 +3791,7 @@ static int htx_apply_filter_to_resp_headers(struct stream *s, struct channel *re
 				case ACT_REMOVE:
 					ctx.blk = blk;
 					ctx.value = v;
+				        ctx.lws_before = ctx.lws_after = 0;
 					if (!http_remove_header(htx, &ctx))
 						return -1;
 					if (!ctx.blk)
@@ -3898,6 +3942,7 @@ static void htx_manage_client_side_cookies(struct stream *s, struct channel *req
 	htx = htxbuf(&req->buf);
 	ctx.blk = NULL;
 	while (http_find_header(htx, ist("Cookie"), &ctx, 1)) {
+		int is_first = 1;
 		del_from = NULL;  /* nothing to be deleted */
 		preserve_hdr = 0; /* assume we may kill the whole header */
 
@@ -3955,8 +4000,9 @@ static void htx_manage_client_side_cookies(struct stream *s, struct channel *req
 
 			/* find att_beg */
 			att_beg = prev;
-			if (prev > hdr_beg)
+			if (!is_first)
 				att_beg++;
+			is_first = 0;
 
 			while (att_beg < hdr_end && HTTP_IS_SPHT(*att_beg))
 				att_beg++;
@@ -4272,7 +4318,7 @@ static void htx_manage_client_side_cookies(struct stream *s, struct channel *req
 		if ((hdr_end - hdr_beg) != ctx.value.len) {
 			if (hdr_beg != hdr_end) {
 				htx_set_blk_value_len(ctx.blk, hdr_end - hdr_beg);
-				htx->data -= (hdr_end - ctx.value.ptr);
+				htx->data -= ctx.value.len - (hdr_end - hdr_beg);
 			}
 			else
 				http_remove_header(htx, &ctx);
@@ -4294,12 +4340,14 @@ static void htx_manage_server_side_cookies(struct stream *s, struct channel *res
 	struct server *srv;
 	char *hdr_beg, *hdr_end;
 	char *prev, *att_beg, *att_end, *equal, *val_beg, *val_end, *next;
-	int is_cookie2;
+	int is_cookie2 = 0;
 
 	htx = htxbuf(&res->buf);
 
 	ctx.blk = NULL;
 	while (1) {
+		int is_first = 1;
+
 		if (!http_find_header(htx, ist("Set-Cookie"), &ctx, 1)) {
 			if (!http_find_header(htx, ist("Set-Cookie2"), &ctx, 1))
 				break;
@@ -4363,8 +4411,9 @@ static void htx_manage_server_side_cookies(struct stream *s, struct channel *res
 
 			/* find att_beg */
 			att_beg = prev;
-			if (prev > hdr_beg)
+			if (!is_first)
 				att_beg++;
+			is_first = 0;
 
 			while (att_beg < hdr_end && HTTP_IS_SPHT(*att_beg))
 				att_beg++;
@@ -4451,9 +4500,9 @@ static void htx_manage_server_side_cookies(struct stream *s, struct channel *res
 				next         += stripped_before;
 				hdr_end      += stripped_before;
 
+				htx_set_blk_value_len(ctx.blk, hdr_end - hdr_beg);
+				htx->data -= ctx.value.len - (hdr_end - hdr_beg);
 				ctx.value.len = hdr_end - hdr_beg;
-				htx_set_blk_value_len(ctx.blk, ctx.value.len);
-				htx->data -= (hdr_end - ctx.value.ptr);
 			}
 
 			/* First, let's see if we want to capture this cookie. We check
@@ -4886,8 +4935,8 @@ static int htx_handle_stats(struct stream *s, struct channel *req)
 
 			h += strlen(STAT_SCOPE_INPUT_NAME) + 1;
 			h2 = h;
-			appctx->ctx.stats.scope_str = h2 - s->txn->uri;
-			while (h <= end) {
+			appctx->ctx.stats.scope_str = h2 - HTX_SL_REQ_UPTR(sl);
+			while (h < end) {
 				if (*h == ';' || *h == '&' || *h == ' ')
 					break;
 				itx++;
@@ -4929,8 +4978,9 @@ static int htx_handle_stats(struct stream *s, struct channel *req)
 		}
 	}
 
-	/* Was the status page requested with a POST ? */
-	if (unlikely(txn->meth == HTTP_METH_POST)) {
+	if (txn->meth == HTTP_METH_GET || txn->meth == HTTP_METH_HEAD)
+		appctx->st0 = STAT_HTTP_HEAD;
+	else if (txn->meth == HTTP_METH_POST) {
 		if (appctx->ctx.stats.flags & STAT_ADMIN) {
 			/* we'll need the request body, possibly after sending 100-continue */
 			if (msg->msg_state < HTTP_MSG_DATA)
@@ -4938,14 +4988,17 @@ static int htx_handle_stats(struct stream *s, struct channel *req)
 			appctx->st0 = STAT_HTTP_POST;
 		}
 		else {
+			/* POST without admin level */
 			appctx->ctx.stats.flags &= ~STAT_CHUNKED;
 			appctx->ctx.stats.st_code = STAT_STATUS_DENY;
 			appctx->st0 = STAT_HTTP_LAST;
 		}
 	}
 	else {
-		/* So it was another method (GET/HEAD) */
-		appctx->st0 = STAT_HTTP_HEAD;
+		/* Unsupported method */
+		appctx->ctx.stats.flags &= ~STAT_CHUNKED;
+		appctx->ctx.stats.st_code = STAT_STATUS_IVAL;
+		appctx->st0 = STAT_HTTP_LAST;
 	}
 
 	s->task->nice = -32; /* small boost for HTTP statistics */
@@ -5024,7 +5077,7 @@ void htx_perform_server_redirect(struct stream *s, struct stream_interface *si)
 	channel_auto_read(req);
 	channel_abort(req);
 	channel_auto_close(req);
-	channel_erase(req);
+	channel_htx_erase(req, htxbuf(&req->buf));
 	channel_auto_read(res);
 	channel_auto_close(res);
 
@@ -5041,7 +5094,7 @@ void htx_perform_server_redirect(struct stream *s, struct stream_interface *si)
   fail:
 	/* If an error occurred, remove the incomplete HTTP response from the
 	 * buffer */
-	channel_truncate(res);
+	channel_htx_truncate(res, htx);
 }
 
 /* This function terminates the request because it was completly analyzed or
@@ -5060,7 +5113,7 @@ static void htx_end_request(struct stream *s)
 	if (unlikely(txn->req.msg_state == HTTP_MSG_ERROR ||
 		     txn->rsp.msg_state == HTTP_MSG_ERROR)) {
 		channel_abort(chn);
-		channel_truncate(chn);
+		channel_htx_truncate(chn, htxbuf(&chn->buf));
 		goto end;
 	}
 
@@ -5068,13 +5121,6 @@ static void htx_end_request(struct stream *s)
 		return;
 
 	if (txn->req.msg_state == HTTP_MSG_DONE) {
-		if (txn->rsp.msg_state < HTTP_MSG_DONE) {
-			/* The server has not finished to respond, so we
-			 * don't want to move in order not to upset it.
-			 */
-			return;
-		}
-
 		/* No need to read anymore, the request was completely parsed.
 		 * We can shut the read side unless we want to abort_on_close,
 		 * or we have a POST request. The issue with POST requests is
@@ -5083,8 +5129,7 @@ static void htx_end_request(struct stream *s)
 		 * buffers, otherwise a close could cause an RST on some systems
 		 * (eg: Linux).
 		 */
-		if ((!(s->be->options & PR_O_ABRT_CLOSE) || (s->si[0].flags & SI_FL_CLEAN_ABRT)) &&
-		    txn->meth != HTTP_METH_POST)
+		if (!(s->be->options & PR_O_ABRT_CLOSE) && txn->meth != HTTP_METH_POST)
 			channel_dont_read(chn);
 
 		/* if the server closes the connection, we want to immediately react
@@ -5098,6 +5143,13 @@ static void htx_end_request(struct stream *s)
 		 * send pending data.
 		 */
 		chn->flags |= CF_NEVER_WAIT;
+
+		if (txn->rsp.msg_state < HTTP_MSG_DONE) {
+			/* The server has not finished to respond, so we
+			 * don't want to move in order not to upset it.
+			 */
+			return;
+		}
 
 		/* When we get here, it means that both the request and the
 		 * response have finished receiving. Depending on the connection
@@ -5157,7 +5209,7 @@ static void htx_end_request(struct stream *s)
 		if (txn->rsp.flags & HTTP_MSGF_XFER_LEN)
 			s->si[1].flags |= SI_FL_NOLINGER;  /* we want to close ASAP */
 		/* see above in MSG_DONE why we only do this in these states */
-		if ((!(s->be->options & PR_O_ABRT_CLOSE) || (s->si[0].flags & SI_FL_CLEAN_ABRT)))
+		if (!(s->be->options & PR_O_ABRT_CLOSE))
 			channel_dont_read(chn);
 		goto end;
 	}
@@ -5194,7 +5246,7 @@ static void htx_end_response(struct stream *s)
 
 	if (unlikely(txn->req.msg_state == HTTP_MSG_ERROR ||
 		     txn->rsp.msg_state == HTTP_MSG_ERROR)) {
-		channel_truncate(&s->req);
+		channel_htx_truncate(&s->req, htxbuf(&s->req.buf));
 		channel_abort(&s->req);
 		goto end;
 	}
@@ -5266,7 +5318,7 @@ static void htx_end_response(struct stream *s)
 	if (txn->rsp.msg_state == HTTP_MSG_CLOSED) {
 	  http_msg_closed:
 		/* drop any pending data */
-		channel_truncate(&s->req);
+		channel_htx_truncate(&s->req, htxbuf(&s->req.buf));
 		channel_abort(&s->req);
 		goto end;
 	}
@@ -5293,13 +5345,13 @@ void htx_server_error(struct stream *s, struct stream_interface *si, int err,
 	channel_auto_read(si_oc(si));
 	channel_abort(si_oc(si));
 	channel_auto_close(si_oc(si));
-	channel_erase(si_oc(si));
+	channel_htx_erase(si_oc(si), htxbuf(&(si_oc(si))->buf));
 	channel_auto_close(si_ic(si));
 	channel_auto_read(si_ic(si));
 
 	/* <msg> is an HTX structure. So we copy it in the response's
 	 * channel */
-	if (msg) {
+	if (msg && !b_is_null(msg)) {
 		struct channel *chn = si_ic(si);
 		struct htx *htx;
 
@@ -5321,15 +5373,15 @@ void htx_reply_and_close(struct stream *s, short status, struct buffer *msg)
 	channel_auto_read(&s->req);
 	channel_abort(&s->req);
 	channel_auto_close(&s->req);
-	channel_erase(&s->req);
-	channel_truncate(&s->res);
+	channel_htx_erase(&s->req, htxbuf(&s->req.buf));
+	channel_htx_truncate(&s->res, htxbuf(&s->res.buf));
 
 	s->txn->flags &= ~TX_WAIT_NEXT_RQ;
 
 	/* <msg> is an HTX structure. So we copy it in the response's
 	 * channel */
 	/* FIXME: It is a problem for now if there is some outgoing data */
-	if (msg) {
+	if (msg && !b_is_null(msg)) {
 		struct channel *chn = &s->res;
 		struct htx *htx;
 
@@ -5389,7 +5441,7 @@ static int htx_reply_100_continue(struct stream *s)
   fail:
 	/* If an error occurred, remove the incomplete HTTP response from the
 	 * buffer */
-	channel_truncate(res);
+	channel_htx_truncate(res, htx);
 	return -1;
 }
 
@@ -5435,10 +5487,12 @@ static int htx_reply_40x_unauthorized(struct stream *s, const char *auth_realm)
 
         if (!htx_add_header(htx, ist("Cache-Control"), ist("no-cache")) ||
 	    !htx_add_header(htx, ist("Connection"), ist("close")) ||
-	    !htx_add_header(htx, ist("Content-Type"), ist("text/html")) ||
-	    !htx_add_header(htx, ist("Proxy-Authenticate"), ist2(trash.area, trash.data)))
+	    !htx_add_header(htx, ist("Content-Type"), ist("text/html")))
 		goto fail;
-
+	if (status == 401 && !htx_add_header(htx, ist("WWW-Authenticate"), ist2(trash.area, trash.data)))
+		goto fail;
+	if (status == 407 && !htx_add_header(htx, ist("Proxy-Authenticate"), ist2(trash.area, trash.data)))
+		goto fail;
 	if (!htx_add_endof(htx, HTX_BLK_EOH) || !htx_add_data(htx, body) || !htx_add_endof(htx, HTX_BLK_EOM))
 		goto fail;
 
@@ -5449,7 +5503,7 @@ static int htx_reply_40x_unauthorized(struct stream *s, const char *auth_realm)
 	channel_auto_read(&s->req);
 	channel_abort(&s->req);
 	channel_auto_close(&s->req);
-	channel_erase(&s->req);
+	channel_htx_erase(&s->req, htxbuf(&s->req.buf));
 
 	res->wex = tick_add_ifset(now_ms, res->wto);
 	channel_auto_read(res);
@@ -5460,7 +5514,7 @@ static int htx_reply_40x_unauthorized(struct stream *s, const char *auth_realm)
   fail:
 	/* If an error occurred, remove the incomplete HTTP response from the
 	 * buffer */
-	channel_truncate(res);
+	channel_htx_truncate(res, htx);
 	return -1;
 }
 

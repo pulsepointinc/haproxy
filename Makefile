@@ -37,6 +37,7 @@
 #   USE_FUTEX            : enable use of futex on kernel 2.6. Automatic.
 #   USE_ACCEPT4          : enable use of accept4() on linux. Automatic.
 #   USE_MY_ACCEPT4       : use own implemention of accept4() if glibc < 2.10.
+#   USE_PRCTL            : enable use of prctl(). Automatic.
 #   USE_ZLIB             : enable zlib library support.
 #   USE_SLZ              : enable slz library instead of zlib (pick at most one).
 #   USE_CPU_AFFINITY     : enable pinning processes to CPU on Linux. Automatic.
@@ -48,6 +49,7 @@
 #   USE_51DEGREES        : enable third party device detection library from 51Degrees
 #   USE_WURFL            : enable WURFL detection library from Scientiamobile
 #   USE_SYSTEMD          : enable sd_notify() support.
+#   USE_OBSOLETE_LINKER  : use when the linker fails to emit __start_init/__stop_init
 #
 # Options can be forced by specifying "USE_xxx=1" or can be disabled by using
 # "USE_xxx=" (empty string).
@@ -101,7 +103,7 @@
 #   SUBVERS        : add a sub-version (eg: platform, model, ...).
 #   VERDATE        : force haproxy's release date.
 #
-#   VARNISHTEST_PROGRAM : location of the varnishtest program to run reg-tests.
+#   VTEST_PROGRAM : location of the vtest program to run reg-tests.
 
 # verbosity: pass V=1 for verbose shell invocation
 V = 0
@@ -175,7 +177,6 @@ REG_TEST_FILES =
 # to be sure we get the intended behavior.
 SPEC_CFLAGS := -fno-strict-aliasing -Wdeclaration-after-statement
 SPEC_CFLAGS += $(call cc-opt-alt,-fwrapv,$(call cc-opt,-fno-strict-overflow))
-SPEC_CFLAGS += $(call cc-nowarn,format-truncation)
 SPEC_CFLAGS += $(call cc-nowarn,address-of-packed-member)
 SPEC_CFLAGS += $(call cc-nowarn,unused-label)
 SPEC_CFLAGS += $(call cc-nowarn,sign-compare)
@@ -333,6 +334,7 @@ ifeq ($(TARGET),linux26)
   USE_CRYPT_H     = implicit
   USE_LIBCRYPT    = implicit
   USE_FUTEX       = implicit
+  USE_PRCTL       = implicit
   USE_DL          = implicit
   USE_RT          = implicit
 else
@@ -349,6 +351,7 @@ ifeq ($(TARGET),linux2628)
   USE_ACCEPT4     = implicit
   USE_FUTEX       = implicit
   USE_CPU_AFFINITY= implicit
+  USE_PRCTL       = implicit
   ASSUME_SPLICE_WORKS= implicit
   USE_DL          = implicit
   USE_RT          = implicit
@@ -358,13 +361,14 @@ ifeq ($(TARGET),solaris)
   # This is for Solaris 8
   # We also enable getaddrinfo() which works since solaris 8.
   USE_POLL       = implicit
-  TARGET_CFLAGS  = -fomit-frame-pointer -DFD_SETSIZE=65536 -D_REENTRANT -D_XOPEN_SOURCE=500 -D__EXTENSIONS__
+  TARGET_CFLAGS  = -DFD_SETSIZE=65536 -D_REENTRANT -D_XOPEN_SOURCE=500 -D__EXTENSIONS__
   TARGET_LDFLAGS = -lnsl -lsocket
   USE_TPROXY     = implicit
   USE_LIBCRYPT    = implicit
   USE_CRYPT_H     = implicit
   USE_GETADDRINFO = implicit
   USE_THREAD      = implicit
+  USE_OBSOLETE_LINKER = implicit
 else
 ifeq ($(TARGET),freebsd)
   # This is for FreeBSD
@@ -400,13 +404,16 @@ ifeq ($(TARGET),aix51)
   # This is for AIX 5.1
   USE_POLL        = implicit
   USE_LIBCRYPT    = implicit
-  TARGET_CFLAGS   = -Dss_family=__ss_family
+  USE_OBSOLETE_LINKER = implicit
+  USE_PRIVATE_CACHE = implicit
+  TARGET_CFLAGS   = -Dss_family=__ss_family -Dip6_hdr=ip6hdr -DSTEVENS_API -D_LINUX_SOURCE_COMPAT -Dunsetenv=my_unsetenv
   DEBUG_CFLAGS    =
 else
 ifeq ($(TARGET),aix52)
   # This is for AIX 5.2 and later
   USE_POLL        = implicit
   USE_LIBCRYPT    = implicit
+  USE_OBSOLETE_LINKER = implicit
   TARGET_CFLAGS   = -D_MSGQSUPPORT
   DEBUG_CFLAGS    =
 else
@@ -415,6 +422,7 @@ ifeq ($(TARGET),cygwin)
   # Cygwin adds IPv6 support only in version 1.7 (in beta right now). 
   USE_POLL   = implicit
   USE_TPROXY = implicit
+  USE_OBSOLETE_LINKER = implicit
   TARGET_CFLAGS  = $(if $(filter 1.5.%, $(shell uname -r)), -DUSE_IPV6 -DAF_INET6=23 -DINET6_ADDRSTRLEN=46, )
 endif # cygwin
 endif # aix52
@@ -464,10 +472,10 @@ endif
 # holding the same names in the current directory.
 
 ifeq ($(IGNOREGIT),)
-VERSION := $(shell [ -d .git/. ] && ref=`(git describe --tags --match 'v*' --abbrev=0) 2>/dev/null` && ref=$${ref%-g*} && echo "$${ref\#v}")
+VERSION := $(shell [ -d .git/. ] && (git describe --tags --match 'v*' --abbrev=0 | cut -c 2-) 2>/dev/null)
 ifneq ($(VERSION),)
 # OK git is there and works.
-SUBVERS := $(shell comms=`git log --format=oneline --no-merges v$(VERSION).. 2>/dev/null | wc -l | tr -dc '0-9'`; commit=`(git log -1 --pretty=%h --abbrev=6) 2>/dev/null`; [ $$comms -gt 0 ] && echo "-$$commit-$$comms")
+SUBVERS := $(shell comms=`git log --format=oneline --no-merges v$(VERSION).. 2>/dev/null | wc -l | tr -d '[:space:]'`; commit=`(git log -1 --pretty=%h --abbrev=6) 2>/dev/null`; [ $$comms -gt 0 ] && echo "-$$commit-$$comms")
 VERDATE := $(shell git log -1 --pretty=format:%ci | cut -f1 -d' ' | tr '-' '/')
 endif
 endif
@@ -532,6 +540,11 @@ endif
 ifneq ($(USE_GETADDRINFO),)
 OPTIONS_CFLAGS  += -DUSE_GETADDRINFO
 BUILD_OPTIONS   += $(call ignore_implicit,USE_GETADDRINFO)
+endif
+
+ifneq ($(USE_OBSOLETE_LINKER),)
+OPTIONS_CFLAGS  += -DUSE_OBSOLETE_LINKER
+BUILD_OPTIONS   += $(call ignore_implicit,USE_OBSOLETE_LINKER)
 endif
 
 ifneq ($(USE_SLZ),)
@@ -609,6 +622,10 @@ endif
 ifneq ($(USE_NETFILTER),)
 OPTIONS_CFLAGS += -DNETFILTER
 BUILD_OPTIONS  += $(call ignore_implicit,USE_NETFILTER)
+endif
+
+ifneq ($(USE_PRCTL),)
+OPTIONS_CFLAGS += -DUSE_PRCTL
 endif
 
 ifneq ($(USE_REGPARM),)
@@ -734,7 +751,13 @@ ifneq ($(USE_51DEGREES),)
 OPTIONS_OBJS    += $(51DEGREES_LIB)/../cityhash/city.o
 OPTIONS_OBJS    += $(51DEGREES_LIB)/51Degrees.o
 OPTIONS_OBJS    += src/51d.o
-OPTIONS_CFLAGS  += -DUSE_51DEGREES -DFIFTYONEDEGREES_NO_THREADING $(if $(51DEGREES_INC),-I$(51DEGREES_INC))
+OPTIONS_CFLAGS  += -DUSE_51DEGREES $(if $(51DEGREES_INC),-I$(51DEGREES_INC))
+ifeq ($(USE_THREAD),)
+OPTIONS_CFLAGS  += -DFIFTYONEDEGREES_NO_THREADING
+else
+OPTIONS_OBJS    += $(51DEGREES_LIB)/../threading.o
+endif
+
 BUILD_OPTIONS   += $(call ignore_implicit,USE_51DEGREES)
 OPTIONS_LDFLAGS += $(if $(51DEGREES_LIB),-L$(51DEGREES_LIB)) -lm
 endif
@@ -970,7 +993,8 @@ help:
 	$(Q)sed -ne "/^[^#]*$$/q;s/^#\(.*\)/\1/p" Makefile
 
 # Used only to force a rebuild if some build options change
-.build_opts: $(shell rm -f .build_opts.new; echo \'$(TARGET) $(BUILD_OPTIONS) $(VERBOSE_CFLAGS)\' > .build_opts.new; if cmp -s .build_opts .build_opts.new; then rm -f .build_opts.new; else mv -f .build_opts.new .build_opts; fi)
+build_opts = $(shell rm -f .build_opts.new; echo \'$(TARGET) $(BUILD_OPTIONS) $(VERBOSE_CFLAGS)\' > .build_opts.new; if cmp -s .build_opts .build_opts.new; then rm -f .build_opts.new; else mv -f .build_opts.new .build_opts; fi)
+.build_opts: $(build_opts)
 
 haproxy: $(OPTIONS_OBJS) $(OBJS) $(EBTREE_OBJS)
 	$(cmd_LD) $(LDFLAGS) -o $@ $^ $(LDOPTS)
@@ -1092,16 +1116,22 @@ opts:
 	@echo 'OPTIONS_OBJS="$(strip $(OPTIONS_OBJS))"'
 	@echo 'OBJS="$(strip $(OBJS))"'
 
+ifeq (reg-tests, $(firstword $(MAKECMDGOALS)))
+  REGTEST_ARGS := $(wordlist 2, $(words $(MAKECMDGOALS)), $(MAKECMDGOALS))
+  $(eval $(REGTEST_ARGS):;@true)
+endif
+
 # Target to run the regression testing script files.
 reg-tests:
-	./scripts/run-regtests.sh --LEVEL "$$LEVEL" $(REG_TEST_FILES)
+	$(Q)./scripts/run-regtests.sh --LEVEL "$(LEVEL)" $(REGTEST_ARGS) $(REG_TEST_FILES)
+.PHONY: $(REGTEST_ARGS)
 
 reg-tests-help:
 	@echo
-	@echo "To launch the reg tests for haproxy, first export to your environment VARNISHTEST_PROGRAM variable to point to your varnishtest program:"
-	@echo "    $$ export VARNISHTEST_PROGRAM=/opt/local/bin/varnishtest"
+	@echo "To launch the reg tests for haproxy, first export to your environment VTEST_PROGRAM variable to point to your vtest program:"
+	@echo "    $$ export VTEST_PROGRAM=/opt/local/bin/vtest"
 	@echo "or"
-	@echo "    $$ setenv VARNISHTEST_PROGRAM /opt/local/bin/varnishtest"
+	@echo "    $$ setenv VTEST_PROGRAM /opt/local/bin/vtest"
 	@echo
 	@echo "The same thing may be done to set your haproxy program with HAPROXY_PROGRAM but with ./haproxy as default value."
 	@echo
@@ -1109,7 +1139,7 @@ reg-tests-help:
 	@echo "    $$ make reg-tests"
 	@echo
 	@echo "You can also set the programs to be used on the command line:"
-	@echo "    $$ VARNISHTEST_PROGRAM=<...> HAPROXY_PROGRAM=<...> make reg-tests"
+	@echo "    $$ VTEST_PROGRAM=<...> HAPROXY_PROGRAM=<...> make reg-tests"
 	@echo
 	@echo "To run tests with specific levels:"
 	@echo "    $$ LEVEL=1,3,4   make reg-tests  #list of levels"
@@ -1120,7 +1150,7 @@ reg-tests-help:
 	@echo "    LEVEL 2 scripts are slow scripts (prefixed with 's' letter)."
 	@echo "    LEVEL 3 scripts are low interest scripts (prefixed with 'l' letter)."
 	@echo "    LEVEL 4 scripts are in relation with bugs they help to reproduce (prefixed with 'b' letter)."
-	@echo "    LEVEL 5 scripts are broken scripts, typically used to fastly disable broken scripts (prefixed with 'k' letter)."
+	@echo "    LEVEL 5 scripts are scripts triggering known broken behaviors for which there is still no fix (prefixed with 'k' letter)."
 	@echo "    LEVEL 6 scripts are experimental, typically used to develop new scripts (prefixed with 'e' lettre)."
 
 .PHONY: reg-tests reg-tests-help

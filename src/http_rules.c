@@ -556,7 +556,8 @@ struct act_rule *parse_http_req_cond(const char **args, const char *file, int li
 		rule->cond = cond;
 	}
 	else if (*args[cur_arg]) {
-		ha_alert("parsing [%s:%d]: 'http-request %s' expects 'realm' for 'auth' or"
+		ha_alert("parsing [%s:%d]: 'http-request %s' expects 'realm' for 'auth',"
+			 " 'deny_status' for 'deny', or"
 			 " either 'if' or 'unless' followed by a condition but found '%s'.\n",
 			 file, linenum, args[0], args[cur_arg]);
 		goto out_err;
@@ -1036,7 +1037,7 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
 	const char *destination = NULL;
 	const char *cookie = NULL;
 	int cookie_set = 0;
-	unsigned int flags = REDIRECT_FLAG_NONE;
+	unsigned int flags = (!dir ? REDIRECT_FLAG_FROM_REQ : REDIRECT_FLAG_NONE);
 	struct acl_cond *cond = NULL;
 
 	cur_arg = 0;
@@ -1183,31 +1184,6 @@ struct redirect_rule *http_parse_redirect_rule(const char *file, int linenum, st
  missing_arg:
 	memprintf(errmsg, "missing argument for '%s'", args[cur_arg]);
 	return NULL;
-}
-
-void free_http_res_rules(struct list *r)
-{
-	struct act_rule *tr, *pr;
-
-	list_for_each_entry_safe(pr, tr, r, list) {
-		LIST_DEL(&pr->list);
-		regex_free(&pr->arg.hdr_add.re);
-		free(pr);
-	}
-}
-
-void free_http_req_rules(struct list *r)
-{
-	struct act_rule *tr, *pr;
-
-	list_for_each_entry_safe(pr, tr, r, list) {
-		LIST_DEL(&pr->list);
-		if (pr->action == ACT_HTTP_REQ_AUTH)
-			free(pr->arg.auth.realm);
-
-		regex_free(&pr->arg.hdr_add.re);
-		free(pr);
-	}
 }
 
 __attribute__((constructor))

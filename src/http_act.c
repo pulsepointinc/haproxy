@@ -34,6 +34,7 @@
 #include <proto/http_rules.h>
 #include <proto/log.h>
 #include <proto/proto_http.h>
+#include <proto/stream_interface.h>
 
 
 /* This function executes one of the set-{method,path,query,uri} actions. It
@@ -185,10 +186,11 @@ static enum act_parse_ret parse_http_set_status(const char **args, int *orig_arg
 static enum act_return http_action_reject(struct act_rule *rule, struct proxy *px,
                                           struct session *sess, struct stream *s, int flags)
 {
+	si_must_kill_conn(chn_prod(&s->req));
 	channel_abort(&s->req);
 	channel_abort(&s->res);
-	s->req.analysers = 0;
-	s->res.analysers = 0;
+	s->req.analysers &= AN_REQ_FLT_END;
+	s->res.analysers &= AN_RES_FLT_END;
 
 	HA_ATOMIC_ADD(&s->be->be_counters.denied_req, 1);
 	HA_ATOMIC_ADD(&sess->fe->fe_counters.denied_req, 1);
@@ -200,7 +202,7 @@ static enum act_return http_action_reject(struct act_rule *rule, struct proxy *p
 	if (!(s->flags & SF_FINST_MASK))
 		s->flags |= SF_FINST_R;
 
-	return ACT_RET_CONT;
+	return ACT_RET_STOP;
 }
 
 /* parse the "reject" action:
@@ -298,7 +300,10 @@ static int check_http_req_capture(struct act_rule *rule, struct proxy *px, char 
 	if (rule->action_ptr != http_action_req_capture_by_id)
 		return 1;
 
-	if (rule->arg.capid.idx >= px->nb_req_cap) {
+	/* capture slots can only be declared in frontends, so we can't check their
+	 * existence in backends at configuration parsing step
+	 */
+	if (px->cap & PR_CAP_FE && rule->arg.capid.idx >= px->nb_req_cap) {
 		memprintf(err, "unable to find capture id '%d' referenced by http-request capture rule",
 			  rule->arg.capid.idx);
 		return 0;

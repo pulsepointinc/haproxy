@@ -18,15 +18,16 @@ feature ignore_unknown_macro
 
 haproxy h1 -W -conf {
   global
-    stats socket ${tmpdir}/h1/stats level admin expose-fd listeners
+    stats socket "${tmpdir}/h1/stats" level admin expose-fd listeners
 
   defaults
     mode http
+    ${no-htx} option http-use-htx
     log global
     option httplog
-    timeout connect         15ms
-    timeout client          20ms
-    timeout server          20ms
+    timeout connect         1s
+    timeout client          1s
+    timeout server          1s
 
   listen testme
     bind "fd@${testme}"
@@ -38,7 +39,7 @@ haproxy h1 -W -conf {
 } -start
 
 shell {
-  kill -USR2 $(cat ${tmpdir}/h1/pid)
+  kill -USR2 $(cat "${tmpdir}/h1/pid")
 }
 
 client c1 -connect ${h1_testme_sock} {

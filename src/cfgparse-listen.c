@@ -300,6 +300,12 @@ static int create_cond_regex_rule(const char *file, int line,
 		goto err_free;
 	}
 
+	if (repl && strchr(repl, '\n')) {
+		ha_warning("parsing [%s:%d] : '%s' : hack involving '\\n' character in replacement string will fail with HTTP/2.\n",
+			 file, line, cmd);
+		ret_code |= ERR_WARN;
+	}
+
 	if (dir == SMP_OPT_DIR_REQ && warnif_misplaced_reqxxx(px, file, line, cmd))
 		ret_code |= ERR_WARN;
 
@@ -426,7 +432,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 		if (curproxy->cap & PR_CAP_BE) {
 			curproxy->lbprm.algo = defproxy.lbprm.algo;
-			curproxy->lbprm.chash.balance_factor = defproxy.lbprm.chash.balance_factor;
+			curproxy->lbprm.hash_balance_factor = defproxy.lbprm.hash_balance_factor;
 			curproxy->fullconn = defproxy.fullconn;
 			curproxy->conn_retries = defproxy.conn_retries;
 			curproxy->redispatch_after = defproxy.redispatch_after;
@@ -467,14 +473,15 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				 curproxy->rdp_cookie_name = strdup(defproxy.rdp_cookie_name);
 			curproxy->rdp_cookie_len = defproxy.rdp_cookie_len;
 
-			if (defproxy.url_param_name)
-				curproxy->url_param_name = strdup(defproxy.url_param_name);
-			curproxy->url_param_len = defproxy.url_param_len;
+			if (defproxy.cookie_attrs)
+				curproxy->cookie_attrs = strdup(defproxy.cookie_attrs);
 
-			if (defproxy.hh_name)
-				curproxy->hh_name = strdup(defproxy.hh_name);
-			curproxy->hh_len  = defproxy.hh_len;
-			curproxy->hh_match_domain  = defproxy.hh_match_domain;
+			if (defproxy.lbprm.arg_str)
+				curproxy->lbprm.arg_str = strdup(defproxy.lbprm.arg_str);
+			curproxy->lbprm.arg_len  = defproxy.lbprm.arg_len;
+			curproxy->lbprm.arg_opt1 = defproxy.lbprm.arg_opt1;
+			curproxy->lbprm.arg_opt2 = defproxy.lbprm.arg_opt2;
+			curproxy->lbprm.arg_opt3 = defproxy.lbprm.arg_opt3;
 
 			if (defproxy.conn_src.iface_name)
 				curproxy->conn_src.iface_name = strdup(defproxy.conn_src.iface_name);
@@ -618,8 +625,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		free(defproxy.rdp_cookie_name);
 		free(defproxy.dyncookie_key);
 		free(defproxy.cookie_domain);
-		free(defproxy.url_param_name);
-		free(defproxy.hh_name);
+		free(defproxy.cookie_attrs);
+		free(defproxy.lbprm.arg_str);
 		free(defproxy.capture_name);
 		free(defproxy.monitor_uri);
 		free(defproxy.defbe.name);
@@ -753,7 +760,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				if (code) {
 					if (err && *err) {
 						indent_msg(&err, 2);
-						ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err);
+						if (((code & (ERR_WARN|ERR_ALERT)) == ERR_WARN))
+							ha_warning("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err);
+						else
+							ha_alert("parsing [%s:%d] : '%s %s' : %s\n", file, linenum, args[0], args[1], err);
 					}
 					else
 						ha_alert("parsing [%s:%d] : '%s %s' : error encountered while processing '%s'.\n",
@@ -948,6 +958,13 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+		if (strcasecmp(args[1], "or") == 0) {
+			ha_warning("parsing [%s:%d] : acl name '%s' will never match. 'or' is used to express a "
+				   "logical disjunction within a condition.\n",
+				   file, linenum, args[1]);
+			err_code |= ERR_WARN;
+		}
+
 		if (parse_acl((const char **)args + 1, &curproxy->acl, &errmsg, &curproxy->conf.args, file, linenum) == NULL) {
 			ha_alert("parsing [%s:%d] : error detected while parsing ACL '%s' : %s.\n",
 				 file, linenum, args[1], errmsg);
@@ -1026,11 +1043,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 					goto out;
 				}
 
-				if (*args[cur_arg + 1] != '.' || !strchr(args[cur_arg + 1] + 1, '.')) {
-					/* rfc2109, 4.3.2 Rejecting Cookies */
-					ha_warning("parsing [%s:%d]: domain '%s' contains no embedded"
-						   " dots nor does not start with a dot."
-						   " RFC forbids it, this configuration may not work properly.\n",
+				if (!strchr(args[cur_arg + 1], '.')) {
+					/* rfc6265, 5.2.3 The Domain Attribute */
+					ha_warning("parsing [%s:%d]: domain '%s' contains no embedded dot,"
+						   " this configuration may not work properly (see RFC6265#5.2.3).\n",
 						   file, linenum, args[cur_arg + 1]);
 					err_code |= ERR_WARN;
 				}
@@ -1108,9 +1124,34 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 					err_code |= ERR_WARN;
 				curproxy->ck_opts |= PR_CK_DYNAMIC;
 			}
+			else if (!strcmp(args[cur_arg], "attr")) {
+				char *val;
+				if (!*args[cur_arg + 1]) {
+					ha_alert("parsing [%s:%d]: '%s' expects <value> as argument.\n",
+						 file, linenum, args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				val = args[cur_arg + 1];
+				while (*val) {
+					if (iscntrl(*val) || *val == ';') {
+						ha_alert("parsing [%s:%d]: character '%%x%02X' is not permitted in attribute value.\n",
+							 file, linenum, *val);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+					val++;
+				}
+				/* don't add ';' for the first attribute */
+				if (!curproxy->cookie_attrs)
+					curproxy->cookie_attrs = strdup(args[cur_arg + 1]);
+				else
+					memprintf(&curproxy->cookie_attrs, "%s; %s", curproxy->cookie_attrs, args[cur_arg + 1]);
+				cur_arg++;
+			}
 
 			else {
-				ha_alert("parsing [%s:%d] : '%s' supports 'rewrite', 'insert', 'prefix', 'indirect', 'nocache', 'postonly', 'domain', 'maxidle', 'dynamic' and 'maxlife' options.\n",
+				ha_alert("parsing [%s:%d] : '%s' supports 'rewrite', 'insert', 'prefix', 'indirect', 'nocache', 'postonly', 'domain', 'maxidle', 'dynamic', 'maxlife' and 'attr' options.\n",
 					 file, linenum, args[0]);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
@@ -3656,8 +3697,8 @@ stats_error_parsing:
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		curproxy->lbprm.chash.balance_factor = atol(args[1]);
-		if (curproxy->lbprm.chash.balance_factor != 0 && curproxy->lbprm.chash.balance_factor <= 100) {
+		curproxy->lbprm.hash_balance_factor = atol(args[1]);
+		if (curproxy->lbprm.hash_balance_factor != 0 && curproxy->lbprm.hash_balance_factor <= 100) {
 			ha_alert("parsing [%s:%d] : '%s' must be 0 or greater than 100.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
@@ -4088,6 +4129,12 @@ stats_error_parsing:
 			goto out;
 		}
 
+		if (strchr(args[1], '\n')) {
+			ha_warning("parsing [%s:%d] : '%s' : hack involving '\\n' character in new header value will fail with HTTP/2.\n",
+				   file, linenum, args[0]);
+			err_code |= ERR_WARN;
+		}
+
 		wl = calloc(1, sizeof(*wl));
 		wl->cond = cond;
 		wl->s = strdup(args[1]);
@@ -4183,6 +4230,12 @@ stats_error_parsing:
 				 file, linenum, args[0], args[2]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
+		}
+
+		if (strchr(args[1], '\n')) {
+			ha_warning("parsing [%s:%d] : '%s' : hack involving '\\n' character in new header value will fail with HTTP/2.\n",
+				   file, linenum, args[0]);
+			err_code |= ERR_WARN;
 		}
 
 		wl = calloc(1, sizeof(*wl));

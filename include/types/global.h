@@ -70,6 +70,7 @@
 #define GTUNE_USE_SYSTEMD        (1<<10)
 
 #define GTUNE_BUSY_POLLING       (1<<11)
+#define GTUNE_SET_DUMPABLE       (1<<13)
 
 /* Access level for a stats socket */
 #define ACCESS_LVL_NONE     0
@@ -210,7 +211,7 @@ extern const int zero;
 extern const int one;
 extern const struct linger nolinger;
 extern int stopping;	/* non zero means stopping in progress */
-extern int killed;	/* non zero means a hard-stop is triggered */
+extern int killed;	/* >0 means a hard-stop is triggered, >1 means hard-stop immediately */
 extern char hostname[MAX_HOSTNAME_LEN];
 extern char localpeer[MAX_HOSTNAME_LEN];
 extern struct list global_listener_queue; /* list of the temporarily limited listeners */
@@ -220,6 +221,8 @@ extern volatile unsigned long sleeping_thread_mask;
 extern struct list proc_list; /* list of process in mworker mode */
 extern struct mworker_proc *proc_self; /* process structure of current process */
 extern int master; /* 1 if in master, 0 otherwise */
+extern unsigned int rlim_fd_cur_at_boot;
+extern unsigned int rlim_fd_max_at_boot;
 
 /* bit values to go with "warned" above */
 #define WARN_BLOCK_DEPRECATED       0x00000001

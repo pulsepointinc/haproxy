@@ -171,16 +171,17 @@ static inline void pendconn_queue_unlock(struct pendconn *p)
 
 /* Removes the pendconn from the server/proxy queue. At this stage, the
  * connection is not really dequeued. It will be done during process_stream().
- * This function takes all the required locks for the operation. The caller is
- * responsible for ensuring that <p> is valid and still in the queue. Use
- * pendconn_cond_unlink() if unsure. When the locks are already held, please
- * use __pendconn_unlink() instead.
+ * This function takes all the required locks for the operation. The pendconn
+ * must be valid, though it doesn't matter if it was already unlinked. Prefer
+ * pendconn_cond_unlink() to first check <p>. When the locks are already held,
+ * please use __pendconn_unlink() instead.
  */
 void pendconn_unlink(struct pendconn *p)
 {
 	pendconn_queue_lock(p);
 
-	__pendconn_unlink(p);
+	if (p->node.node.leaf_p)
+		__pendconn_unlink(p);
 
 	pendconn_queue_unlock(p);
 }
@@ -311,16 +312,16 @@ void process_srv_queue(struct server *s)
 	struct proxy  *p = s->proxy;
 	int maxconn;
 
-	HA_SPIN_LOCK(PROXY_LOCK,  &p->lock);
 	HA_SPIN_LOCK(SERVER_LOCK, &s->lock);
+	HA_SPIN_LOCK(PROXY_LOCK,  &p->lock);
 	maxconn = srv_dynamic_maxconn(s);
 	while (s->served < maxconn) {
 		int ret = pendconn_process_next_strm(s, p);
 		if (!ret)
 			break;
 	}
-	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 	HA_SPIN_UNLOCK(PROXY_LOCK,  &p->lock);
+	HA_SPIN_UNLOCK(SERVER_LOCK, &s->lock);
 }
 
 /* Adds the stream <strm> to the pending connection queue of server <strm>->srv
@@ -396,7 +397,7 @@ struct pendconn *pendconn_add(struct stream *strm)
 int pendconn_redistribute(struct server *s)
 {
 	struct pendconn *p;
-	struct eb32_node *node;
+	struct eb32_node *node, *nodeb;
 	int xferred = 0;
 
 	/* The REDISP option was specified. We will ignore cookie and force to
@@ -404,8 +405,10 @@ int pendconn_redistribute(struct server *s)
 	if ((s->proxy->options & (PR_O_REDISP|PR_O_PERSIST)) != PR_O_REDISP)
 		return 0;
 
-	for (node = eb32_first(&s->pendconns); node; node = eb32_next(node)) {
-		p = eb32_entry(&node, struct pendconn, node);
+	for (node = eb32_first(&s->pendconns); node; node = nodeb) {
+		nodeb =	eb32_next(node);
+
+		p = eb32_entry(node, struct pendconn, node);
 		if (p->strm_flags & SF_FORCE_PRST)
 			continue;
 
@@ -421,7 +424,8 @@ int pendconn_redistribute(struct server *s)
 /* Check for pending connections at the backend, and assign some of them to
  * the server coming up. The server's weight is checked before being assigned
  * connections it may not be able to handle. The total number of transferred
- * connections is returned.
+ * connections is returned. It must be called with the server lock held, and
+ * will take the proxy's lock.
  */
 int pendconn_grab_from_px(struct server *s)
 {

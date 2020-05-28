@@ -180,12 +180,15 @@ struct check {
 	int send_string_len;			/* length of agent command string */
 	char *send_string;			/* optionally send a string when connecting to the agent */
 	struct server *server;			/* back-pointer to server */
+	struct proxy *proxy;                    /* proxy to be used */
 	char **argv;				/* the arguments to use if running a process-based check */
 	char **envp;				/* the environment to use if running a process-based check */
 	struct pid_list *curpid;		/* entry in pid_list used for current process-based test, or -1 if not in test */
 	struct sockaddr_storage addr;   	/* the address to check */
 	struct wait_event wait_list;            /* Waiting for I/O events */
 	char *sni;				/* Server name */
+	char *alpn_str;                         /* ALPN to use for checks */
+	int alpn_len;                           /* ALPN string length */
 };
 
 struct check_status {

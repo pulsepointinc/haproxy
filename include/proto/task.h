@@ -116,6 +116,8 @@ __decl_hathreads(extern HA_SPINLOCK_T wq_lock);  /* spin lock related to wait qu
 
 
 static inline void task_insert_into_tasklet_list(struct task *t);
+static inline struct task *task_unlink_wq(struct task *t);
+static inline void task_queue(struct task *task);
 
 /* return 0 if task is in run queue, otherwise non-zero */
 static inline int task_in_rq(struct task *t)
@@ -123,7 +125,7 @@ static inline int task_in_rq(struct task *t)
 	/* Check if leaf_p is NULL, in case he's not in the runqueue, and if
 	 * it's not 0x1, which would mean it's in the tasklet list.
 	 */
-	return t->rq.node.leaf_p != NULL && t->rq.node.leaf_p != (void *)0x1;
+	return t->rq.node.leaf_p != NULL;
 }
 
 /* return 0 if task is in wait queue, otherwise non-zero */
@@ -153,14 +155,30 @@ static inline void task_wakeup(struct task *t, unsigned int f)
 #endif
 
 	state = HA_ATOMIC_OR(&t->state, f);
-	if (!(state & TASK_RUNNING))
+	while (!(state & (TASK_RUNNING | TASK_QUEUED))) {
+		if (HA_ATOMIC_CAS(&t->state, &state, state | TASK_QUEUED))
+			break;
+	}
+	if (!(state & (TASK_QUEUED | TASK_RUNNING)))
 		__task_wakeup(t, root);
 }
 
-/* change the thread affinity of a task to <thread_mask> */
+/* change the thread affinity of a task to <thread_mask>.
+ * This may only be done from within the running task itself or during its
+ * initialization. It will unqueue and requeue the task from the wait queue
+ * if it was in it. This is safe against a concurrent task_queue() call because
+ * task_queue() itself will unlink again if needed after taking into account
+ * the new thread_mask.
+ */
 static inline void task_set_affinity(struct task *t, unsigned long thread_mask)
 {
-	t->thread_mask = thread_mask;
+	if (unlikely(task_in_wq(t))) {
+		task_unlink_wq(t);
+		t->thread_mask = thread_mask;
+		task_queue(t);
+	}
+	else
+		t->thread_mask = thread_mask;
 }
 
 /*
@@ -176,16 +194,19 @@ static inline struct task *__task_unlink_wq(struct task *t)
 }
 
 /* remove a task from its wait queue. It may either be the local wait queue if
- * the task is bound to a single thread (in which case there's no locking
- * involved) or the global queue, with locking.
+ * the task is bound to a single thread or the global queue. If the task uses a
+ * shared wait queue, the global wait queue lock is used.
  */
 static inline struct task *task_unlink_wq(struct task *t)
 {
+	unsigned long locked;
+
 	if (likely(task_in_wq(t))) {
-		if (atleast2(t->thread_mask))
+		locked = t->state & TASK_SHARED_WQ;
+		if (locked)
 			HA_SPIN_LOCK(TASK_WQ_LOCK, &wq_lock);
 		__task_unlink_wq(t);
-		if (atleast2(t->thread_mask))
+		if (locked)
 			HA_SPIN_UNLOCK(TASK_WQ_LOCK, &wq_lock);
 	}
 	return t;
@@ -219,24 +240,22 @@ static inline struct task *__task_unlink_rq(struct task *t)
  */
 static inline struct task *task_unlink_rq(struct task *t)
 {
-	if (t->thread_mask != tid_bit)
+	int is_global = t->state & TASK_GLOBAL;
+
+	if (is_global)
 		HA_SPIN_LOCK(TASK_RQ_LOCK, &rq_lock);
 	if (likely(task_in_rq(t))) {
 		if (&t->rq == rq_next)
 			rq_next = eb32sc_next(rq_next, tid_bit);
 		__task_unlink_rq(t);
 	}
-	if (t->thread_mask != tid_bit)
+	if (is_global)
 		HA_SPIN_UNLOCK(TASK_RQ_LOCK, &rq_lock);
 	return t;
 }
 
 static inline void tasklet_wakeup(struct tasklet *tl)
 {
-	if (!TASK_IS_TASKLET(tl)) {
-		task_insert_into_tasklet_list((struct task *)tl);
-		return;
-	}
 	if (!LIST_ISEMPTY(&tl->list))
 		return;
 	LIST_ADDQ(&task_per_thread[tid].task_list, &tl->list);
@@ -249,30 +268,28 @@ static inline void tasklet_wakeup(struct tasklet *tl)
 static inline void task_insert_into_tasklet_list(struct task *t)
 {
 	struct tasklet *tl;
-	void *expected = NULL;
 
-	/* Protect ourself against anybody trying to insert the task into
-	 * another runqueue. We set leaf_p to 0x1 to indicate that the node is
-	 * not in a tree but that it's in the tasklet list. See task_in_rq().
-	 */
-	if (unlikely(!HA_ATOMIC_CAS(&t->rq.node.leaf_p, &expected, (void *)0x1)))
-		return;
 	HA_ATOMIC_ADD(&tasks_run_queue, 1);
 	task_per_thread[tid].task_list_size++;
 	tl = (struct tasklet *)t;
 	LIST_ADDQ(&task_per_thread[tid].task_list, &tl->list);
 }
 
-static inline void task_remove_from_task_list(struct task *t)
+/* remove the task from the tasklet list. The task MUST already be there. If
+ * unsure, use task_remove_from_task_list() instead.
+ */
+static inline void __task_remove_from_tasklet_list(struct task *t)
 {
 	LIST_DEL(&((struct tasklet *)t)->list);
 	LIST_INIT(&((struct tasklet *)t)->list);
 	task_per_thread[tid].task_list_size--;
 	HA_ATOMIC_SUB(&tasks_run_queue, 1);
-	if (!TASK_IS_TASKLET(t)) {
-		t->rq.node.leaf_p = NULL; // was 0x1
-		__ha_barrier_store();
-	}
+}
+
+static inline void task_remove_from_tasklet_list(struct task *t)
+{
+	if (likely(!LIST_ISEMPTY(&((struct tasklet *)t)->list)))
+		__task_remove_from_tasklet_list(t);
 }
 
 /*
@@ -289,7 +306,8 @@ static inline struct task *task_delete(struct task *t)
 /*
  * Initialize a new task. The bare minimum is performed (queue pointers and
  * state).  The task is returned. This function should not be used outside of
- * task_new().
+ * task_new(). If the thread mask contains more than one thread, TASK_SHARED_WQ
+ * is set.
  */
 static inline struct task *task_init(struct task *t, unsigned long thread_mask)
 {
@@ -297,6 +315,8 @@ static inline struct task *task_init(struct task *t, unsigned long thread_mask)
 	t->rq.node.leaf_p = NULL;
 	t->state = TASK_SLEEPING;
 	t->thread_mask = thread_mask;
+	if (atleast2(thread_mask))
+		t->state |= TASK_SHARED_WQ;
 	t->nice = 0;
 	t->calls = 0;
 	t->call_date = 0;
@@ -357,7 +377,7 @@ static inline void task_free(struct task *t)
 	/* There's no need to protect t->state with a lock, as the task
 	 * has to run on the current thread.
 	 */
-	if (t == curr_task || !(t->state & TASK_RUNNING))
+	if (t == curr_task || !(t->state & (TASK_QUEUED | TASK_RUNNING)))
 		__task_free(t);
 	else
 		t->process = NULL;
@@ -365,8 +385,10 @@ static inline void task_free(struct task *t)
 
 static inline void tasklet_free(struct tasklet *tl)
 {
-	if (!LIST_ISEMPTY(&tl->list))
+	if (!LIST_ISEMPTY(&tl->list)) {
 		task_per_thread[tid].task_list_size--;
+		HA_ATOMIC_SUB(&tasks_run_queue, 1);
+	}
 	LIST_DEL(&tl->list);
 
 	pool_free(pool_head_tasklet, tl);
@@ -378,9 +400,9 @@ void __task_queue(struct task *task, struct eb_root *wq);
 
 /* Place <task> into the wait queue, where it may already be. If the expiration
  * timer is infinite, do nothing and rely on wake_expired_task to clean up.
- * If the task is bound to a single thread, it's assumed to be bound to the
- * current thread's queue and is queued without locking. Otherwise it's queued
- * into the global wait queue, protected by locks.
+ * If the task uses a shared wait queue, it's queued into the global wait queue,
+ * protected by the global wq_lock, otherwise by it necessarily belongs to the
+ * current thread'sand is queued without locking.
  */
 static inline void task_queue(struct task *task)
 {
@@ -397,7 +419,7 @@ static inline void task_queue(struct task *task)
 		return;
 
 #ifdef USE_THREAD
-	if (atleast2(task->thread_mask)) {
+	if (task->state & TASK_SHARED_WQ) {
 		HA_SPIN_LOCK(TASK_WQ_LOCK, &wq_lock);
 		if (!task_in_wq(task) || tick_is_lt(task->expire, task->wq.key))
 			__task_queue(task, &timers);
@@ -421,7 +443,7 @@ static inline void task_schedule(struct task *task, int when)
 		return;
 
 #ifdef USE_THREAD
-	if (atleast2(task->thread_mask)) {
+	if (task->state & TASK_SHARED_WQ) {
 		HA_SPIN_LOCK(TASK_WQ_LOCK, &wq_lock);
 		if (task_in_wq(task))
 			when = tick_first(when, task->expire);
@@ -537,6 +559,19 @@ static inline int notification_registered(struct list *wake)
 {
 	return !LIST_ISEMPTY(wake);
 }
+
+/* adds list item <item> to work list <work> and wake up the associated task */
+static inline void work_list_add(struct work_list *work, struct list *item)
+{
+	LIST_ADDQ_LOCKED(&work->head, item);
+	task_wakeup(work->task, TASK_WOKEN_OTHER);
+}
+
+struct work_list *work_list_create(int nbthread,
+                                   struct task *(*fct)(struct task *, void *, unsigned short),
+                                   void *arg);
+
+void work_list_destroy(struct work_list *work, int nbthread);
 
 /*
  * This does 3 things :

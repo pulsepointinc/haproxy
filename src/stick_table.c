@@ -694,7 +694,7 @@ struct stktable_key *smp_to_stkey(struct sample *smp, struct stktable *t)
 		/* The stick table require a 32bit unsigned int, "sint" is a
 		 * signed 64 it, so we can convert it inplace.
 		 */
-		*(unsigned int *)&smp->data.u.sint = (unsigned int)smp->data.u.sint;
+		smp->data.u.sint = (unsigned int)smp->data.u.sint;
 		static_table_key.key = &smp->data.u.sint;
 		static_table_key.key_len = 4;
 		break;
@@ -1682,9 +1682,9 @@ static enum act_parse_ret parse_inc_gpc0(const char **args, int *arg, struct pro
 			return ACT_RET_PRS_ERR;
 		}
 
-		if (rule->arg.gpc.sc >= ACT_ACTION_TRK_SCMAX) {
+		if (rule->arg.gpc.sc >= MAX_SESS_STKCTR) {
 			memprintf(err, "invalid stick table track ID. The max allowed ID is %d",
-			          ACT_ACTION_TRK_SCMAX-1);
+			          MAX_SESS_STKCTR-1);
 			return ACT_RET_PRS_ERR;
 		}
 	}
@@ -1764,9 +1764,9 @@ static enum act_parse_ret parse_inc_gpc1(const char **args, int *arg, struct pro
 			return ACT_RET_PRS_ERR;
 		}
 
-		if (rule->arg.gpc.sc >= ACT_ACTION_TRK_SCMAX) {
+		if (rule->arg.gpc.sc >= MAX_SESS_STKCTR) {
 			memprintf(err, "invalid stick table track ID. The max allowed ID is %d",
-			          ACT_ACTION_TRK_SCMAX-1);
+			          MAX_SESS_STKCTR-1);
 			return ACT_RET_PRS_ERR;
 		}
 	}
@@ -1842,9 +1842,9 @@ static enum act_parse_ret parse_set_gpt0(const char **args, int *arg, struct pro
 			return ACT_RET_PRS_ERR;
 		}
 
-		if (rule->arg.gpt.sc >= ACT_ACTION_TRK_SCMAX) {
+		if (rule->arg.gpt.sc >= MAX_SESS_STKCTR) {
 			memprintf(err, "invalid stick table track ID '%s'. The max allowed ID is %d",
-			          args[*arg-1], ACT_ACTION_TRK_SCMAX-1);
+			          args[*arg-1], MAX_SESS_STKCTR-1);
 			return ACT_RET_PRS_ERR;
 		}
 	}
@@ -1914,8 +1914,6 @@ smp_fetch_sc_stkctr(struct session *sess, struct stream *strm, const struct arg 
 	if (num == '_' - '0') {
 		/* sc_* variant, args[0] = ctr# (mandatory) */
 		num = args[arg++].data.sint;
-		if (num >= MAX_SESS_STKCTR)
-			return NULL;
 	}
 	else if (num > 9) { /* src_* variant, args[0] = table */
 		struct stktable_key *key;
@@ -1946,7 +1944,10 @@ smp_fetch_sc_stkctr(struct session *sess, struct stream *strm, const struct arg 
 	 * the sc[0-9]_ form, or even higher using sc_(num) if needed.
 	 * args[arg] is the first optional argument. We first lookup the
 	 * ctr form the stream, then from the session if it was not there.
+	 * But we must be sure the counter does not exceed MAX_SESS_STKCTR.
 	 */
+	if (num >= MAX_SESS_STKCTR)
+		return NULL;
 
 	if (strm)
 		stkptr = &strm->stkctr[num];

@@ -315,19 +315,12 @@ struct proxy {
 	int  cookie_len;			/* strlen(cookie_name), computed only once */
 	char *cookie_domain;			/* domain used to insert the cookie */
 	char *cookie_name;			/* name of the cookie to look for */
+	char *cookie_attrs;                     /* list of attributes to add to the cookie */
 	char *dyncookie_key;			/* Secret key used to generate dynamic persistent cookies */
 	unsigned int cookie_maxidle;		/* max idle time for this cookie */
 	unsigned int cookie_maxlife;		/* max life time for this cookie */
 	char *rdp_cookie_name;			/* name of the RDP cookie to look for */
 	int  rdp_cookie_len;			/* strlen(rdp_cookie_name), computed only once */
-	char *url_param_name;			/* name of the URL parameter used for hashing */
-	int  url_param_len;			/* strlen(url_param_name), computed only once */
-	int  uri_len_limit;			/* character limit for uri balancing algorithm */
-	int  uri_dirs_depth1;			/* directories+1 (slashes) limit for uri balancing algorithm */
-	int  uri_whole;				/* if != 0, calculates the hash from the whole uri. Still honors the len_limit and dirs_depth1 */
-	char *hh_name;				/* name of the header parameter used for hashing */
-	int  hh_len;				/* strlen(hh_name), computed only once */
-	int  hh_match_domain;			/* toggle use of special match function */
 	char *capture_name;			/* beginning of the name of the cookie to capture */
 	int  capture_namelen;			/* length of the cookie name to match */
 	int  capture_len;			/* length of the string to be captured */
@@ -471,7 +464,7 @@ struct proxy {
 						 * name is used
 						 */
 	struct list filter_configs;		/* list of the filters that are declared on this proxy */
-	__decl_hathreads(HA_SPINLOCK_T lock);
+	__decl_hathreads(HA_SPINLOCK_T lock);   /* may be taken under the server's lock */
 };
 
 struct switching_rule {

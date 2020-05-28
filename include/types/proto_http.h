@@ -94,7 +94,7 @@
 #define TX_CON_CLO_SET  0x00400000	/* "connection: close" is now set */
 #define TX_CON_KAL_SET  0x00800000	/* "connection: keep-alive" is now set */
 
-#define TX_PREFER_LAST  0x01000000      /* try to stay on same server if possible (eg: after 401) */
+/* unused: 0x01000000 */
 
 #define TX_HDR_CONN_UPG 0x02000000	/* The "Upgrade" token was found in the "Connection" header */
 #define TX_WAIT_NEXT_RQ	0x04000000	/* waiting for the second request to start, use keep-alive timeout */
@@ -155,6 +155,7 @@ enum {
 	REDIRECT_FLAG_NONE = 0,
 	REDIRECT_FLAG_DROP_QS = 1,	/* drop query string */
 	REDIRECT_FLAG_APPEND_SLASH = 2,	/* append a slash if missing at the end */
+	REDIRECT_FLAG_FROM_REQ = 4,     /* redirect rule on the request path */
 };
 
 /* Redirect types (location, prefix, extended ) */
@@ -181,19 +182,6 @@ enum rule_result {
 	HTTP_RULE_RES_ABRT,      /* abort request, msg already sent (eg: auth) */
 	HTTP_RULE_RES_DONE,      /* processing done, stop processing (eg: redirect) */
 	HTTP_RULE_RES_BADREQ,    /* bad request */
-};
-
-/* status codes available for the stats admin page */
-enum {
-	STAT_STATUS_INIT = 0,
-	STAT_STATUS_DENY,	/* action denied */
-	STAT_STATUS_DONE,	/* the action is successful */
-	STAT_STATUS_ERRP,	/* an error occurred due to invalid values in parameters */
-	STAT_STATUS_EXCD,	/* an error occurred because the buffer couldn't store all data */
-	STAT_STATUS_NONE,	/* nothing happened (no action chosen or servers state didn't change) */
-	STAT_STATUS_PART,	/* the action is partially successful */
-	STAT_STATUS_UNKN,	/* an unknown error occurred, shouldn't happen */
-	STAT_STATUS_SIZE
 };
 
 /* Legacy version of the HTTP/1 message state, used by the channels, should

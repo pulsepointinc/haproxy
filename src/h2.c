@@ -25,12 +25,41 @@
  * OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include <stdint.h>
+#include <inttypes.h>
 #include <common/config.h>
 #include <common/h2.h>
 #include <common/http-hdr.h>
 #include <common/ist.h>
 
+struct h2_frame_definition h2_frame_definition[H2_FT_ENTRIES] =	{
+	 [H2_FT_DATA         ] = { .dir = 3, .min_id = 1, .max_id = H2_MAX_STREAM_ID, .min_len = 0, .max_len = H2_MAX_FRAME_LEN, },
+	 [H2_FT_HEADERS      ] = { .dir = 3, .min_id = 1, .max_id = H2_MAX_STREAM_ID, .min_len = 1, .max_len = H2_MAX_FRAME_LEN, },
+	 [H2_FT_PRIORITY     ] = { .dir = 3, .min_id = 1, .max_id = H2_MAX_STREAM_ID, .min_len = 5, .max_len = 5,                },
+	 [H2_FT_RST_STREAM   ] = { .dir = 3, .min_id = 1, .max_id = H2_MAX_STREAM_ID, .min_len = 4, .max_len = 4,                },
+	 [H2_FT_SETTINGS     ] = { .dir = 3, .min_id = 0, .max_id = 0,                .min_len = 0, .max_len = H2_MAX_FRAME_LEN, },
+	 [H2_FT_PUSH_PROMISE ] = { .dir = 0, .min_id = 1, .max_id = H2_MAX_STREAM_ID, .min_len = 4, .max_len = H2_MAX_FRAME_LEN, },
+	 [H2_FT_PING         ] = { .dir = 3, .min_id = 0, .max_id = 0,                .min_len = 8, .max_len = 8,                },
+	 [H2_FT_GOAWAY       ] = { .dir = 3, .min_id = 0, .max_id = 0,                .min_len = 8, .max_len = H2_MAX_FRAME_LEN, },
+	 [H2_FT_WINDOW_UPDATE] = { .dir = 3, .min_id = 0, .max_id = H2_MAX_STREAM_ID, .min_len = 4, .max_len = 4,                },
+	 [H2_FT_CONTINUATION ] = { .dir = 3, .min_id = 1, .max_id = H2_MAX_STREAM_ID, .min_len = 0, .max_len = H2_MAX_FRAME_LEN, },
+};
+
+/* Looks into <ist> for forbidden characters for header values (0x00, 0x0A,
+ * 0x0D), starting at pointer <start> which must be within <ist>. Returns
+ * non-zero if such a character is found, 0 otherwise. When run on unlikely
+ * header match, it's recommended to first check for the presence of control
+ * chars using ist_find_ctl().
+ */
+static int has_forbidden_char(const struct ist ist, const char *start)
+{
+	do {
+		if ((uint8_t)*start <= 0x0d &&
+		    (1U << (uint8_t)*start) & ((1<<13) | (1<<10) | (1<<0)))
+			return 1;
+		start++;
+	} while (start < ist.ptr + ist.len);
+	return 0;
+}
 
 /* Prepare the request line into <*ptr> (stopping at <end>) from pseudo headers
  * stored in <phdr[]>. <fields> indicates what was found so far. This should be
@@ -130,10 +159,11 @@ static int h2_prepare_h1_reqline(uint32_t fields, struct ist *phdr, char **ptr, 
  * The Cookie header will be reassembled at the end, and for this, the <list>
  * will be used to create a linked list, so its contents may be destroyed.
  */
-int h2_make_h1_request(struct http_hdr *list, char *out, int osize, unsigned int *msgf)
+int h2_make_h1_request(struct http_hdr *list, char *out, int osize, unsigned int *msgf, unsigned long long *body_len)
 {
 	struct ist phdr_val[H2_PHDR_NUM_ENTRIES];
 	char *out_end = out + osize;
+	const char *ctl;
 	uint32_t fields; /* bit mask of H2_PHDR_FND_* */
 	uint32_t idx;
 	int ck, lck; /* cookie index and last cookie index */
@@ -150,13 +180,25 @@ int h2_make_h1_request(struct http_hdr *list, char *out, int osize, unsigned int
 		}
 		else {
 			/* this can be any type of header */
-			/* RFC7540#8.1.2: upper case not allowed in header field names */
-			for (i = 0; i < list[idx].n.len; i++)
-				if ((uint8_t)(list[idx].n.ptr[i] - 'A') < 'Z' - 'A')
-					goto fail;
-
+			/* RFC7540#8.1.2: upper case not allowed in header field names.
+			 * #10.3: header names must be valid (i.e. match a token).
+			 * For pseudo-headers we check from 2nd char and for other ones
+			 * from the first char, because HTTP_IS_TOKEN() also excludes
+			 * the colon.
+			 */
 			phdr = h2_str_to_phdr(list[idx].n);
+
+			for (i = !!phdr; i < list[idx].n.len; i++)
+				if ((uint8_t)(list[idx].n.ptr[i] - 'A') < 'Z' - 'A' || !HTTP_IS_TOKEN(list[idx].n.ptr[i]))
+					goto fail;
 		}
+
+		/* RFC7540#10.3: intermediaries forwarding to HTTP/1 must take care of
+		 * rejecting NUL, CR and LF characters.
+		 */
+		ctl = ist_find_ctl(list[idx].v);
+		if (unlikely(ctl) && has_forbidden_char(list[idx].v, ctl))
+			goto fail;
 
 		if (phdr > 0 && phdr < H2_PHDR_NUM_ENTRIES) {
 			/* insert a pseudo header by its index (in phdr) and value (in value) */
@@ -191,9 +233,14 @@ int h2_make_h1_request(struct http_hdr *list, char *out, int osize, unsigned int
 		if (isteq(list[idx].n, ist("host")))
 			fields |= H2_PHDR_FND_HOST;
 
-		if ((*msgf & (H2_MSGF_BODY|H2_MSGF_BODY_TUNNEL|H2_MSGF_BODY_CL)) == H2_MSGF_BODY &&
-		    isteq(list[idx].n, ist("content-length")))
-			*msgf |= H2_MSGF_BODY_CL;
+		if (isteq(list[idx].n, ist("content-length"))) {
+			ret = h2_parse_cont_len_header(msgf, &list[idx].v, body_len);
+			if (ret < 0)
+				goto fail;
+
+			if (ret == 0)
+				continue; // skip this duplicate
+		}
 
 		/* these ones are forbidden in requests (RFC7540#8.1.2.2) */
 		if (isteq(list[idx].n, ist("connection")) ||
@@ -320,6 +367,83 @@ int h2_make_h1_request(struct http_hdr *list, char *out, int osize, unsigned int
 	return -1;
 }
 
+/* Takes an H2 headers list <list> terminated by a name being <NULL,0> and
+ * emits the equivalent HTTP/1.1 trailers block not including the empty line.
+ * The output contents are emitted in <out> for a max of <osize> bytes, and the
+ * amount of bytes emitted is returned. In case of error, a negative error code
+ * is returned. The caller must have verified that the message in the buffer is
+ * compatible with receipt of trailers.
+ *
+ * The headers list <list> must be composed of :
+ *   - n.name != NULL, n.len  > 0 : literal header name
+ *   - n.name == NULL, n.len  > 0 : indexed pseudo header name number <n.len>
+ *                                  among H2_PHDR_IDX_* (illegal here)
+ *   - n.name ignored, n.len == 0 : end of list
+ *   - in all cases except the end of list, v.name and v.len must designate a
+ *     valid value.
+ */
+int h2_make_h1_trailers(struct http_hdr *list, char *out, int osize)
+{
+	char *out_end = out + osize;
+	const char *ctl;
+	uint32_t idx;
+	int i;
+
+	for (idx = 0; list[idx].n.len != 0; idx++) {
+		if (!list[idx].n.ptr) {
+			/* This is an indexed pseudo-header (RFC7540#8.1.2.1) */
+			goto fail;
+		}
+
+		/* RFC7540#8.1.2: upper case not allowed in header field names.
+		 * #10.3: header names must be valid (i.e. match a token). This
+		 * also catches pseudo-headers which are forbidden in trailers.
+		 */
+		for (i = 0; i < list[idx].n.len; i++)
+			if ((uint8_t)(list[idx].n.ptr[i] - 'A') < 'Z' - 'A' || !HTTP_IS_TOKEN(list[idx].n.ptr[i]))
+				goto fail;
+
+		/* these ones are forbidden in trailers (RFC7540#8.1.2.2) */
+		if (isteq(list[idx].n, ist("host")) ||
+		    isteq(list[idx].n, ist("content-length")) ||
+		    isteq(list[idx].n, ist("connection")) ||
+		    isteq(list[idx].n, ist("proxy-connection")) ||
+		    isteq(list[idx].n, ist("keep-alive")) ||
+		    isteq(list[idx].n, ist("upgrade")) ||
+		    isteq(list[idx].n, ist("te")) ||
+		    isteq(list[idx].n, ist("transfer-encoding")))
+			goto fail;
+
+		if (out + list[idx].n.len + 2 + list[idx].v.len + 2 > out_end) {
+			/* too large */
+			goto fail;
+		}
+
+		/* RFC7540#10.3: intermediaries forwarding to HTTP/1 must take care of
+		 * rejecting NUL, CR and LF characters.
+		 */
+		ctl = ist_find_ctl(list[idx].v);
+		if (unlikely(ctl) && has_forbidden_char(list[idx].v, ctl))
+			goto fail;
+
+		/* copy "name: value" */
+		memcpy(out, list[idx].n.ptr, list[idx].n.len);
+		out += list[idx].n.len;
+		*(out++) = ':';
+		*(out++) = ' ';
+
+		memcpy(out, list[idx].v.ptr, list[idx].v.len);
+		out += list[idx].v.len;
+		*(out++) = '\r';
+		*(out++) = '\n';
+	}
+
+	return out + osize - out_end;
+
+ fail:
+	return -1;
+}
+
 /* Parse the Content-Length header field of an HTTP/2 request. The function
  * checks all possible occurrences of a comma-delimited value, and verifies
  * if any of them doesn't match a previous value. It returns <0 if a value
@@ -404,6 +528,7 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
 	int uri_idx = H2_PHDR_IDX_PATH;
 	unsigned int flags = HTX_SL_F_NONE;
 	struct htx_sl *sl;
+	size_t i;
 
 	if ((fields & H2_PHDR_FND_METH) && isteq(phdr[H2_PHDR_IDX_METH], ist("CONNECT"))) {
 		/* RFC 7540 #8.2.6 regarding CONNECT: ":scheme" and ":path"
@@ -450,6 +575,13 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
 	if (!phdr[uri_idx].len)
 		goto fail;
 
+	/* make sure :path doesn't contain LWS nor CTL characters */
+	for (i = 0; i < phdr[uri_idx].len; i++) {
+		unsigned char c = phdr[uri_idx].ptr[i];
+		if (HTTP_IS_LWS(c) || HTTP_IS_CTL(c))
+			htx->flags |= HTX_FL_PARSING_ERROR;
+	}
+
 	/* Set HTX start-line flags */
 	flags |= HTX_SL_F_VER_11;    // V2 in fact
 	flags |= HTX_SL_F_XFER_LEN;  // xfer len always known with H2
@@ -485,7 +617,7 @@ static struct htx_sl *h2_prepare_htx_reqline(uint32_t fields, struct ist *phdr, 
  * The Cookie header will be reassembled at the end, and for this, the <list>
  * will be used to create a linked list, so its contents may be destroyed.
  */
-int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *msgf)
+int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *msgf, unsigned long long *body_len)
 {
 	struct ist phdr_val[H2_PHDR_NUM_ENTRIES];
 	uint32_t fields; /* bit mask of H2_PHDR_FND_* */
@@ -496,7 +628,7 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 	int i;
 	struct htx_sl *sl = NULL;
 	unsigned int sl_flags = 0;
-	unsigned long long body_len;
+	const char *ctl;
 
 	lck = ck = -1; // no cookie for now
 	fields = 0;
@@ -507,13 +639,25 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 		}
 		else {
 			/* this can be any type of header */
-			/* RFC7540#8.1.2: upper case not allowed in header field names */
-			for (i = 0; i < list[idx].n.len; i++)
-				if ((uint8_t)(list[idx].n.ptr[i] - 'A') < 'Z' - 'A')
-					goto fail;
-
+			/* RFC7540#8.1.2: upper case not allowed in header field names.
+			 * #10.3: header names must be valid (i.e. match a token).
+			 * For pseudo-headers we check from 2nd char and for other ones
+			 * from the first char, because HTTP_IS_TOKEN() also excludes
+			 * the colon.
+			 */
 			phdr = h2_str_to_phdr(list[idx].n);
+
+			for (i = !!phdr; i < list[idx].n.len; i++)
+				if ((uint8_t)(list[idx].n.ptr[i] - 'A') < 'Z' - 'A' || !HTTP_IS_TOKEN(list[idx].n.ptr[i]))
+					goto fail;
 		}
+
+		/* RFC7540#10.3: intermediaries forwarding to HTTP/1 must take care of
+		 * rejecting NUL, CR and LF characters.
+		 */
+		ctl = ist_find_ctl(list[idx].v);
+		if (unlikely(ctl) && has_forbidden_char(list[idx].v, ctl))
+			goto fail;
 
 		if (phdr > 0 && phdr < H2_PHDR_NUM_ENTRIES) {
 			/* insert a pseudo header by its index (in phdr) and value (in value) */
@@ -549,7 +693,7 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 			fields |= H2_PHDR_FND_HOST;
 
 		if (isteq(list[idx].n, ist("content-length"))) {
-			ret = h2_parse_cont_len_header(msgf, &list[idx].v, &body_len);
+			ret = h2_parse_cont_len_header(msgf, &list[idx].v, body_len);
 			if (ret < 0)
 				goto fail;
 
@@ -597,6 +741,9 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 			goto fail;
 	}
 
+	if (!(*msgf & H2_MSGF_BODY) || ((*msgf & H2_MSGF_BODY_CL) && *body_len == 0))
+		sl_flags |= HTX_SL_F_BODYLESS;
+
 	/* update the start line with last detected header info */
 	sl->flags |= sl_flags;
 
@@ -636,6 +783,7 @@ int h2_make_htx_request(struct http_hdr *list, struct htx *htx, unsigned int *ms
 				goto fail;
 
 			htx_set_blk_value_len(blk, tl);
+			htx->data += vl+2;
 			*(char *)(htx_get_blk_ptr(htx, blk) + bs + 0) = ';';
 			*(char *)(htx_get_blk_ptr(htx, blk) + bs + 1) = ' ';
 			memcpy(htx_get_blk_ptr(htx, blk) + bs + 2, list[ck].v.ptr, vl);
@@ -690,6 +838,17 @@ static struct htx_sl *h2_prepare_htx_stsline(uint32_t fields, struct ist *phdr, 
 
 	sl->info.res.status = h * 100 + t * 10 + u;
 
+	/* On 1xx responses (except 101) there is no ES on the HEADERS frame but
+	 * there is no body. So remove the flag H2_MSGF_BODY and add
+	 * H2_MSGF_RSP_1XX to notify the decoder another HEADERS frame is
+	 * expected.
+	 */
+	if (sl->info.res.status < 200 &&
+	    (sl->info.res.status == 100 || sl->info.res.status >= 102)) {
+		*msgf |= H2_MSGF_RSP_1XX;
+		*msgf &= ~H2_MSGF_BODY;
+	}
+
 	return sl;
  fail:
 	return NULL;
@@ -713,7 +872,7 @@ static struct htx_sl *h2_prepare_htx_stsline(uint32_t fields, struct ist *phdr, 
  *   - in all cases except the end of list, v.name and v.len must designate a
  *     valid value.
  */
-int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *msgf)
+int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *msgf, unsigned long long *body_len)
 {
 	struct ist phdr_val[H2_PHDR_NUM_ENTRIES];
 	uint32_t fields; /* bit mask of H2_PHDR_FND_* */
@@ -723,7 +882,7 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 	int i;
 	struct htx_sl *sl = NULL;
 	unsigned int sl_flags = 0;
-	unsigned long long body_len;
+	const char *ctl;
 
 	fields = 0;
 	for (idx = 0; list[idx].n.len != 0; idx++) {
@@ -733,13 +892,25 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 		}
 		else {
 			/* this can be any type of header */
-			/* RFC7540#8.1.2: upper case not allowed in header field names */
-			for (i = 0; i < list[idx].n.len; i++)
-				if ((uint8_t)(list[idx].n.ptr[i] - 'A') < 'Z' - 'A')
-					goto fail;
-
+			/* RFC7540#8.1.2: upper case not allowed in header field names.
+			 * #10.3: header names must be valid (i.e. match a token).
+			 * For pseudo-headers we check from 2nd char and for other ones
+			 * from the first char, because HTTP_IS_TOKEN() also excludes
+			 * the colon.
+			 */
 			phdr = h2_str_to_phdr(list[idx].n);
+
+			for (i = !!phdr; i < list[idx].n.len; i++)
+				if ((uint8_t)(list[idx].n.ptr[i] - 'A') < 'Z' - 'A' || !HTTP_IS_TOKEN(list[idx].n.ptr[i]))
+					goto fail;
 		}
+
+		/* RFC7540#10.3: intermediaries forwarding to HTTP/1 must take care of
+		 * rejecting NUL, CR and LF characters.
+		 */
+		ctl = ist_find_ctl(list[idx].v);
+		if (unlikely(ctl) && has_forbidden_char(list[idx].v, ctl))
+			goto fail;
 
 		if (phdr > 0 && phdr < H2_PHDR_NUM_ENTRIES) {
 			/* insert a pseudo header by its index (in phdr) and value (in value) */
@@ -772,7 +943,7 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 		}
 
 		if (isteq(list[idx].n, ist("content-length"))) {
-			ret = h2_parse_cont_len_header(msgf, &list[idx].v, &body_len);
+			ret = h2_parse_cont_len_header(msgf, &list[idx].v, body_len);
 			if (ret < 0)
 				goto fail;
 
@@ -804,6 +975,9 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 			goto fail;
 	}
 
+	if (!(*msgf & H2_MSGF_BODY) || ((*msgf & H2_MSGF_BODY_CL) && *body_len == 0))
+		sl_flags |= HTX_SL_F_BODYLESS;
+
 	/* update the start line with last detected header info */
 	sl->flags |= sl_flags;
 
@@ -819,6 +993,93 @@ int h2_make_htx_response(struct http_hdr *list, struct htx *htx, unsigned int *m
 
 	ret = 1;
 	return ret;
+
+ fail:
+	return -1;
+}
+
+/* Takes an H2 headers list <list> terminated by a name being <NULL,0> and
+ * emits the equivalent HTX trailers block not including the empty line. The
+ * output contents are emitted in <htx>, and a positive value is returned if
+ * some bytes were emitted. In case of error, a negative error code is
+ * returned. The caller must have verified that the message in the buffer is
+ * compatible with receipt of trailers. Note that for now the HTX trailers
+ * block is in fact an H1 block and it must contain the trailing CRLF.
+ *
+ * The headers list <list> must be composed of :
+ *   - n.name != NULL, n.len  > 0 : literal header name
+ *   - n.name == NULL, n.len  > 0 : indexed pseudo header name number <n.len>
+ *                                  among H2_PHDR_IDX_* (illegal here)
+ *   - n.name ignored, n.len == 0 : end of list
+ *   - in all cases except the end of list, v.name and v.len must designate a
+ *     valid value.
+ */
+int h2_make_htx_trailers(struct http_hdr *list, struct htx *htx)
+{
+	struct htx_blk *blk;
+	char *out;
+	const char *ctl;
+	uint32_t idx;
+	int len;
+	int i;
+
+	len = 2; // CRLF
+	for (idx = 0; list[idx].n.len != 0; idx++) {
+		if (!list[idx].n.ptr) {
+			/* This is an indexed pseudo-header (RFC7540#8.1.2.1) */
+			goto fail;
+		}
+
+		/* RFC7540#8.1.2: upper case not allowed in header field names.
+		 * #10.3: header names must be valid (i.e. match a token). This
+		 * also catches pseudo-headers which are forbidden in trailers.
+		 */
+		for (i = 0; i < list[idx].n.len; i++)
+			if ((uint8_t)(list[idx].n.ptr[i] - 'A') < 'Z' - 'A' || !HTTP_IS_TOKEN(list[idx].n.ptr[i]))
+				goto fail;
+
+		/* these ones are forbidden in trailers (RFC7540#8.1.2.2) */
+		if (isteq(list[idx].n, ist("host")) ||
+		    isteq(list[idx].n, ist("content-length")) ||
+		    isteq(list[idx].n, ist("connection")) ||
+		    isteq(list[idx].n, ist("proxy-connection")) ||
+		    isteq(list[idx].n, ist("keep-alive")) ||
+		    isteq(list[idx].n, ist("upgrade")) ||
+		    isteq(list[idx].n, ist("te")) ||
+		    isteq(list[idx].n, ist("transfer-encoding")))
+			goto fail;
+
+		/* RFC7540#10.3: intermediaries forwarding to HTTP/1 must take care of
+		 * rejecting NUL, CR and LF characters.
+		 */
+		ctl = ist_find_ctl(list[idx].v);
+		if (unlikely(ctl) && has_forbidden_char(list[idx].v, ctl))
+			goto fail;
+
+		len += list[idx].n.len + 2 + list[idx].v.len + 2;
+	}
+
+	blk = htx_add_blk_type_size(htx, HTX_BLK_TLR, len);
+	if (!blk)
+		goto fail;
+
+	out = htx_get_blk_ptr(htx, blk);
+	for (idx = 0; list[idx].n.len != 0; idx++) {
+		/* copy "name: value" */
+		memcpy(out, list[idx].n.ptr, list[idx].n.len);
+		out += list[idx].n.len;
+		*(out++) = ':';
+		*(out++) = ' ';
+
+		memcpy(out, list[idx].v.ptr, list[idx].v.len);
+		out += list[idx].v.len;
+		*(out++) = '\r';
+		*(out++) = '\n';
+	}
+	*(out++) = '\r';
+	*(out++) = '\n';
+
+	return 1;
 
  fail:
 	return -1;

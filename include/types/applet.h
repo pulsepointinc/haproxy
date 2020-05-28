@@ -49,6 +49,7 @@ struct applet {
 
 #define APPCTX_CLI_ST1_PROMPT  (1 << 0)
 #define APPCTX_CLI_ST1_PAYLOAD (1 << 1)
+#define APPCTX_CLI_ST1_NOLF    (1 << 2)
 
 /* Context of a running applet. */
 struct appctx {
@@ -161,6 +162,11 @@ struct appctx {
 			struct task *task;
 			struct hlua_function *fcn;
 		} hlua_cli;
+		struct {
+			void *target;
+			struct peers *peers; /* "peers" section being currently dumped. */
+			struct peer *peer;   /* "peer" being currently dumped. */
+		} cfgpeers;
 		/* NOTE: please add regular applet contexts (ie: not
 		 * CLI-specific ones) above, before "cli".
 		 */

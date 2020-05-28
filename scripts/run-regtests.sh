@@ -1,6 +1,7 @@
 #!/bin/sh
 
-if [ "$1" = "--help" ]; then
+_help()
+{
   cat << EOF
 ### run-regtests.sh ###
   Running run-regtests.sh --help shows this information about how to use it
@@ -12,14 +13,30 @@ if [ "$1" = "--help" ]; then
     run-regtests.sh ./tests1 ./tests2
 
   Parameters:
-    --j <NUM>, To run varnishtest with multiple jobs / threads for a faster overall result
+    --j <NUM>, To run vtest with multiple jobs / threads for a faster overall result
       run-regtests.sh ./fasttest --j 16
 
     --v, to run verbose
-      run-regtests.sh --v, disables the default varnishtest 'quiet' parameter
+      run-regtests.sh --v, disables the default vtest 'quiet' parameter
 
-    --varnishtestparams <ARGS>, passes custom ARGS to varnishtest
-      run-regtests.sh --varnishtestparams "-n 10"
+    --debug to show test logs on standard ouput (implies --v)
+      run-regtests.sh --debug
+
+    --keep-logs to keep all log directories (by default kept if test fails)
+      run-regtests.sh --keep-logs
+
+    --vtestparams <ARGS>, passes custom ARGS to vtest
+      run-regtests.sh --vtestparams "-n 10"
+
+    --clean to cleanup previous reg-tests log directories and exit
+      run-regtests.sh --clean
+
+    --use-htx to use the HTX in tests
+      run-regtests.sh --use-htx, unsets the macro \${no-htx}
+      In .vtc files, in HAProxy configuration, you should use the following line
+      to "templatize" your tests:
+
+          \${no-htx} option http-use-htx
 
   Including text below into a .vtc file will check for its requirements
   related to haproxy's target and compilation options
@@ -31,21 +48,21 @@ if [ "$1" = "--help" ]; then
     # Below option is required to complete this test succesfully
     #REQUIRE_OPTION=OPENSSL, this test needs OPENSSL compiled in.
 
-    #REQUIRE_OPTIONS=ZLIB,OPENSSL,LUA
+    #REQUIRE_OPTIONS=ZLIB|SLZ,OPENSSL,LUA
 
     # To define a range of versions that a test can run with:
     #REQUIRE_VERSION=0.0
     #REQUIRE_VERSION_BELOW=99.9
 
-  Configure environment variables to set the haproxy and varnishtest binaries to use
+  Configure environment variables to set the haproxy and vtest binaries to use
     setenv HAPROXY_PROGRAM /usr/local/sbin/haproxy
-    setenv VARNISHTEST_PROGRAM /usr/local/bin/varnishtest
+    setenv VTEST_PROGRAM /usr/local/bin/vtest
   or
     export HAPROXY_PROGRAM=/usr/local/sbin/haproxy
-    export VARNISHTEST_PROGRAM=/usr/local/bin/varnishtest
+    export VTEST_PROGRAM=/usr/local/bin/vtest
 EOF
-  return
-fi
+  exit 0
+}
 
 add_range_to_test_list()
 {
@@ -139,8 +156,18 @@ _findtests() {
     skiptest=
     require_version="$(sed -ne 's/^#REQUIRE_VERSION=//p' "$i")"
     require_version_below="$(sed -ne 's/^#REQUIRE_VERSION_BELOW=//p' "$i")"
-    require_options="$(sed -ne 's/^#REQUIRE_OPTIONS=//p' "$i")"
-    exclude_targets=",$(sed -ne 's/^#EXCLUDE_TARGETS=//p' "$i"),"
+    require_options="$(sed -ne 's/^#REQUIRE_OPTIONS=//p' "$i" | sed  -e 's/,/ /g')"
+    exclude_targets="$(sed -ne 's/^#EXCLUDE_TARGETS=//p' "$i" | sed  -e 's/,/ /g')"
+
+    requiredoption="$(sed -ne 's/^#REQUIRE_OPTION=//p' "$i" | sed  -e 's/,.*//')"
+    if [ -n "$requiredoption" ]; then
+      require_options="$require_options $requiredoption"
+    fi
+
+    excludedtarget="$(sed -ne 's/^#EXCLUDE_TARGET=//p' "$i" | sed  -e 's/,.*//')"
+    if [ -n "$excludedtarget" ]; then
+      exclude_targets="$exclude_targets $excludedtarget"
+    fi
 
     if [ -n "$require_version" ]; then
       if [ $(_version "$HAPROXY_VERSION") -lt $(_version "$require_version") ]; then
@@ -157,46 +184,26 @@ _findtests() {
       fi
     fi
 
-    if [ -n "$( echo "$exclude_targets" | grep ",$TARGET," )" ]; then
-      echo "  Skip $i because exclude_targets"
-      echo "    REASON: exclude_targets '$exclude_targets' contains '$TARGET'"
-      skiptest=1
-    fi
+    for excludedtarget in $exclude_targets; do
+      if [ "$excludedtarget" = "$TARGET" ]; then
+        echo "  Skip $i because haproxy is compiled for the excluded target $TARGET"
+        skiptest=1
+      fi
+    done
 
-    #echo "REQUIRE_OPTIONS : $require_options"
-    for requiredoption in $(echo $require_options | tr "," "\012" ); do
-      if [ -z "$( echo "$OPTIONS" | grep "USE_$requiredoption=1" )" ]
-      then
-        echo "  Skip $i because option $requiredoption not found"
-        echo -n "    REASON: "
-        echo -n "$required" | sed -e 's/.*,//' -e 's/^[[:space:]]//'
-        echo
+    for requiredoption in $require_options; do
+      alternatives=$(echo "$requiredoption" | sed -e 's/|/ /g')
+      found=
+      for alt in $alternatives; do
+        if [ -n "$( echo "$OPTIONS" | grep "USE_$alt=1" )" ]; then
+          found=1;
+	fi
+      done
+      if [ -z $found ]; then
+        echo "  Skip $i because haproxy is not compiled with the required option $requiredoption"
         skiptest=1
       fi
     done
-    for required in "$(grep "#REQUIRE_OPTION=" "$i")";
-    do
-      if [ -z "$required" ]
-      then
-        continue
-      fi
-      requiredoption=$(echo "$required" | sed -e 's/.*=//' -e 's/,.*//')
-      if [ -z "$( echo "$OPTIONS" | grep "USE_$requiredoption=1" )" ]
-      then
-        echo "  Skip $i because option $requiredoption not found"
-        echo -n "    REASON: "
-        echo "$required" | sed -e 's/.*,//' -e 's/^[[:space:]]//'
-        skiptest=1
-      fi
-    done
-    testtarget=$(grep "#EXCLUDE_TARGET=" "$i")
-    if [ "$( echo "$testtarget" | grep "#EXCLUDE_TARGET=$TARGET," )" ]
-    then
-      echo "  Skip $i because: TARGET = $TARGET"
-      echo -n "    REASON: "
-      echo "$testtarget" | sed -e 's/.*,//' -e 's/^[[:space:]]//'
-      skiptest=1
-    fi
 
     if [ -z $skiptest ]; then
       echo "  Add test: $i"
@@ -205,10 +212,35 @@ _findtests() {
   done
 }
 
-_process() {
-  jobcount=""
-  verbose="-q"
+_cleanup()
+{
+  DIRS=$(find "${TESTDIR}" -maxdepth 1 -type d -name "haregtests-*" -exec basename {} \; 2>/dev/null)
+  if [ -z "${DIRS}" ]; then
+    echo "No reg-tests log directory found"
+  else
+    echo "Cleanup following reg-tests log directories:"
+    for d in ${DIRS}; do
+      echo  "    o ${TESTDIR}/$d"
+    done
+    read -p "Continue (y/n)?" reply
+    case "$reply" in
+      y|Y)
+        for d in ${DIRS}; do
+          rm -r "${TESTDIR}/$d"
+        done
+        echo "done"
+        exit 0
+        ;;
+       *)
+        echo "aborted"
+        exit 1
+        ;;
+    esac
+  fi
+}
 
+
+_process() {
   while [ ${#} -gt 0 ]; do
     if _startswith "$1" "-"; then
       case "${1}" in
@@ -216,51 +248,75 @@ _process() {
           jobcount="$2"
           shift
           ;;
-        --varnishtestparams)
-          varnishtestparams="$2"
+        --vtestparams)
+          vtestparams="$2"
           shift
           ;;
         --v)
           verbose=""
           ;;
+        --debug)
+          verbose=""
+          debug="-v"
+          ;;
+        --keep-logs)
+          keep_logs="-L"
+          ;;
         --LEVEL)
           LEVEL="$2"
           shift
           ;;
+        --use-htx)
+          no_htx=""
+          ;;
+        --clean)
+          _cleanup
+          exit 0
+          ;;
+        --help)
+          _help
+          ;;
         *)
           echo "Unknown parameter : $1"
-          return 1
+          exit 1
           ;;
       esac
     else
-      _findtests "$1"
-      pathwasset=1
+      REGTESTS="${REGTESTS} $1"
     fi
     shift 1
   done
-  if [ -z $pathwasset ]; then
-    # no path was given, find all tests under current path
-    _findtests ./
-  fi
 }
 
 _version() {
   echo "$@" | awk -F. '{ printf("%d%03d%03d%03d\012", $1,$2,$3,$4); }';
 }
 
-echo ""
-echo "########################## Preparing to run tests ##########################"
 
 HAPROXY_PROGRAM="${HAPROXY_PROGRAM:-${PWD}/haproxy}"
-VARNISHTEST_PROGRAM="${VARNISHTEST_PROGRAM:-varnishtest}"
+VTEST_PROGRAM="${VTEST_PROGRAM:-vtest}"
+TESTDIR="${TMPDIR:-/tmp}"
+REGTESTS=""
+
+jobcount=""
+verbose="-q"
+debug=""
+keep_logs="-l"
+no_htx="#"
+testlist=""
+
+_process "$@";
+
+echo ""
+echo "########################## Preparing to run tests ##########################"
 
 preparefailed=
 if ! [ -x "$(command -v $HAPROXY_PROGRAM)" ]; then
   echo "haproxy not found in path, please specify HAPROXY_PROGRAM environment variable"
   preparefailed=1
 fi
-if ! [ -x "$(command -v $VARNISHTEST_PROGRAM)" ]; then
-  echo "varnishtest not found in path, please specify VARNISHTEST_PROGRAM environment variable"
+if ! [ -x "$(command -v $VTEST_PROGRAM)" ]; then
+  echo "vtest not found in path, please specify VTEST_PROGRAM environment variable"
   preparefailed=1
 fi
 if [ $preparefailed ]; then
@@ -276,9 +332,8 @@ echo "Testing with haproxy version: $HAPROXY_VERSION"
 
 TESTRUNDATETIME="$(date '+%Y-%m-%d_%H-%M-%S')"
 
-TESTDIR="${TMPDIR:-/tmp}"
 mkdir -p "$TESTDIR" || exit 1
-TESTDIR=$(mktemp -d "$TESTDIR/$TESTRUNDATETIME.XXXXXX") || exit 1
+TESTDIR=$(mktemp -d "$TESTDIR/haregtests-$TESTRUNDATETIME.XXXXXX") || exit 1
 
 export TMPDIR="$TESTDIR"
 export HAPROXY_PROGRAM="$HAPROXY_PROGRAM"
@@ -350,39 +405,58 @@ echo "Target : $TARGET"
 echo "Options : $OPTIONS"
 
 echo "########################## Gathering tests to run ##########################"
+# if 'use-htx' option is set, but HAProxy version is lower to 1.9, disable it
+if [ -z "$no_htx" ]; then
+  if [ $(_version "$HAPROXY_VERSION") -lt $(_version "1.9") ]; then
+    echo ""
+    echo "WARNING : Unset HTX for haproxy (version: $HAPROXY_VERSION)"
+    echo "    REASON: this test requires at least version: 1.9"
+    echo ""
+    no_htx="#"
+  fi
+fi
 
-testlist=""
-pathwasset=
+if [ -z "$REGTESTS" ]; then
+  _findtests ./
+else
+  for t in $REGTESTS; do
+    _findtests $t
+  done
+fi
 
-_process "$@";
-
-echo "########################## Starting varnishtest ##########################"
+echo "########################## Starting vtest ##########################"
 echo "Testing with haproxy version: $HAPROXY_VERSION"
 _vtresult=0
 if [ -n "$testlist" ]; then
   if [ -n "$jobcount" ]; then
     jobcount="-j $jobcount"
   fi
-  $VARNISHTEST_PROGRAM $varnishtestparams $verbose $jobcount -l -k -t 10 $testlist
+  cmd="$VTEST_PROGRAM -k -t 10 -Dno-htx=${no_htx} $keep_logs $verbose $debug $jobcount $vtestparams $testlist"
+  eval $cmd
   _vtresult=$?
 else
   echo "No tests found that meet the required criteria"
 fi
-if [ $_vtresult != 0 ]
-then
-  echo "########################## Gathering failed results ##########################"
+
+
+if [ $_vtresult -eq 0 ]; then
+  # all tests were succesfull, removing tempdir (the last part.)
+  # ignore errors is the directory is not empty or if it does not exist
+   rmdir "$TESTDIR" 2>/dev/null
+fi
+
+if [ -d "${TESTDIR}" ]; then
+  echo "########################## Gathering results ##########################"
   export TESTDIR
   find "$TESTDIR" -type d -name "vtc.*" -exec sh -c 'for i; do
     if [ ! -e "$i/LOG" ] ; then continue; fi
+
     cat <<- EOF | tee -a "$TESTDIR/failedtests.log"
 $(echo "###### $(cat "$i/INFO") ######")
 $(echo "## test results in: \"$i\"")
-$(grep -- ---- "$i/LOG")
+$(grep -E -- "^(----|\*    diag)" "$i/LOG")
 EOF
   done' sh {} +
-  exit 1
-else
-  # all tests were succesfull, removing tempdir (the last part.)
-  rmdir "$TESTDIR"
 fi
-exit 0
+
+exit $_vtresult

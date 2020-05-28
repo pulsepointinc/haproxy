@@ -26,12 +26,14 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk)
 	struct buffer *chunk = get_trash_chunk();
 	struct htx *tmp = htxbuf(chunk);
 	struct htx_blk *newblk, *oldblk;
-	uint32_t new, old;
+	uint32_t new, old, blkpos;
 	uint32_t addr, blksz;
 	int32_t sl_off = -1;
 
 	if (!htx->used)
 		return NULL;
+
+	blkpos = -1;
 
 	new  = 0;
 	addr = 0;
@@ -54,21 +56,22 @@ struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk)
 		if (htx->sl_off == oldblk->addr)
 			sl_off = addr;
 
+		/* if <blk> is defined, set its new position */
+		if (blk != NULL && blk == oldblk)
+			blkpos = new;
+
 		memcpy((void *)tmp->blocks + addr, htx_get_blk_ptr(htx, oldblk), blksz);
 		new++;
 		addr += blksz;
 
-		/* if <blk> is defined, set its new location */
-		if (blk != NULL && blk == oldblk)
-			blk = newblk;
-	} while (new < htx->used);
+	}
 
 	htx->sl_off = sl_off;
 	htx->wrap = htx->used;
 	htx->front = htx->tail = new - 1;
 	memcpy((void *)htx->blocks, (void *)tmp->blocks, htx->size);
 
-	return blk;
+	return ((blkpos == -1) ? NULL : htx_get_blk(htx, blkpos));
 }
 
 /* Reserves a new block in the HTTP message <htx> with a content of <blksz>
@@ -284,6 +287,63 @@ struct htx_blk *htx_remove_blk(struct htx *htx, struct htx_blk *blk)
 	return blk;
 }
 
+/* Truncate all blocks after the one containing the offset <offset>. This last
+ * one is truncated too.
+ */
+void htx_truncate(struct htx *htx, uint32_t offset)
+{
+	struct htx_blk *blk;
+	struct htx_ret htxret;
+
+	htxret = htx_find_blk(htx, offset);
+	blk = htxret.blk;
+	if (blk && htxret.ret) {
+		uint32_t sz = htx_get_blksz(blk);
+
+		htx_set_blk_value_len(blk, sz - htxret.ret);
+		blk = htx_get_next_blk(htx, blk);
+	}
+	while (blk)
+		blk = htx_remove_blk(htx, blk);
+}
+
+/* Drain <count> bytes from the HTX message <htx>. DATA blocks will be cut if
+ * necessary. Others blocks will be removed at once if <count> is large
+ * enough. The function returns an htx_ret with the first block remaing in the
+ * messsage and the amount of data drained. If everything is removed,
+ * htx_ret.blk is set to NULL.
+ */
+struct htx_ret htx_drain(struct htx *htx, uint32_t count)
+{
+	struct htx_blk *blk;
+	struct htx_ret htxret = { .blk = NULL, .ret = 0 };
+
+	blk = htx_get_head_blk(htx);
+	while (count && blk) {
+		uint32_t sz = htx_get_blksz(blk);
+		enum htx_blk_type type = htx_get_blk_type(blk);
+
+		/* Ingore unused block */
+		if (type == HTX_BLK_UNUSED)
+			goto next;
+
+		if (sz > count) {
+			if (type == HTX_BLK_DATA) {
+				htx_cut_data_blk(htx, blk, count);
+				htxret.ret += count;
+			}
+			break;
+		}
+		count -= sz;
+		htxret.ret += sz;
+	  next:
+		blk = htx_remove_blk(htx, blk);
+	}
+	htxret.blk = blk;
+
+	return htxret;
+}
+
 /* Tries to append data to the last inserted block, if the type matches and if
  * there is enough non-wrapping space. Only DATA and TRAILERS content can be
  * appended. If the append fails, a new block is inserted. If an error occurred,
@@ -293,8 +353,9 @@ struct htx_blk *htx_remove_blk(struct htx *htx, struct htx_blk *blk)
 static struct htx_blk *htx_append_blk_value(struct htx *htx, enum htx_blk_type type,
 					    const struct ist data)
 {
-	struct htx_blk *blk;
-	struct ist     v;
+	struct htx_blk *blk, *tailblk, *headblk, *frtblk;
+	struct ist v;
+	int32_t room;
 
 	if (!htx->used)
 		goto add_new_block;
@@ -307,47 +368,45 @@ static struct htx_blk *htx_append_blk_value(struct htx *htx, enum htx_blk_type t
 	if (type != HTX_BLK_DATA && type != HTX_BLK_TLR)
 		goto add_new_block;
 
-	/* get the tail block */
-	blk = htx_get_blk(htx, htx->tail);
+	/* get the tail and head block */
+	tailblk = htx_get_tail_blk(htx);
+	headblk = htx_get_head_blk(htx);
+	if (tailblk == NULL || headblk == NULL)
+		goto add_new_block;
 
 	/* Don't try to append data if the last inserted block is not of the
 	 * same type */
-	if (type != htx_get_blk_type(blk))
+	if (type != htx_get_blk_type(tailblk))
 		goto add_new_block;
 
 	/*
 	 * Same type and enough space: append data
 	 */
-	if (htx->tail + 1 == htx->wrap) {
-		struct htx_blk *frtblk = htx_get_blk(htx, htx->front);
-		int32_t tailroom = sizeof(htx->blocks[0]) * htx_pos_to_idx(htx, htx->tail) - (frtblk->addr + htx_get_blksz(frtblk));
-		if (tailroom >= (int32_t)data.len)
-			goto append_data;
-		htx_defrag(htx, NULL);
-		blk = htx_get_blk(htx, htx->tail);
+	frtblk = htx_get_blk(htx, htx->front);
+	if (tailblk->addr >= headblk->addr) {
+		if (htx->tail != htx->front)
+			goto add_new_block;
+		room = sizeof(htx->blocks[0]) * htx_pos_to_idx(htx, htx->tail) - (frtblk->addr + htx_get_blksz(frtblk));
 	}
-	else {
-		struct htx_blk *headblk = htx_get_blk(htx, htx_get_head(htx));
-		int32_t headroom = headblk->addr - (blk->addr + htx_get_blksz(blk));
-		if (headroom >= (int32_t)data.len)
-			goto append_data;
-		htx_defrag(htx, NULL);
-		blk = htx_get_blk(htx, htx->tail);
-	}
+	else
+		room = headblk->addr - (tailblk->addr + htx_get_blksz(tailblk));
+
+	if (room < (int32_t)data.len)
+		tailblk = htx_defrag(htx, tailblk);
 
   append_data:
 	/* get the value of the tail block */
 	/* FIXME: check v.len + data.len < 256MB */
-	v = htx_get_blk_value(htx, blk);
+	v = htx_get_blk_value(htx, tailblk);
 
 	/* Append data and update the block itself */
 	memcpy(v.ptr + v.len, data.ptr, data.len);
-	htx_set_blk_value_len(blk, v.len + data.len);
+	htx_set_blk_value_len(tailblk, v.len + data.len);
 
 	/* Update HTTP message */
 	htx->data += data.len;
 
-	return blk;
+	return tailblk;
 
   add_new_block:
 	/* FIXME: check tlr.len (< 256MB) */
@@ -457,13 +516,13 @@ struct htx_ret htx_xfer_blks(struct htx *dst, struct htx *src, uint32_t count,
 
 		info = blk->info;
 		max = htx_free_data_space(dst);
-		if (max > count)
-			max = count;
+		if (max > count - ret)
+			max = count - ret;
 		if (sz > max) {
 			sz = max;
 			info = (type << 28) + sz;
 			/* Headers and pseudo headers must be fully copied  */
-			if (type < HTX_BLK_DATA || !sz)
+			if (type != HTX_BLK_DATA || !sz)
 				break;
 		}
 
@@ -658,6 +717,22 @@ struct htx_blk *htx_add_header(struct htx *htx, const struct ist name,
 	return blk;
 }
 
+/* Adds an HTX block of type <type> in <htx>, of size <blksz>. It returns the
+ * new block on success. Otherwise, it returns NULL. The caller is responsible
+ * for filling the block itself.
+ */
+struct htx_blk *htx_add_blk_type_size(struct htx *htx, enum htx_blk_type type, uint32_t blksz)
+{
+	struct htx_blk *blk;
+
+	blk = htx_add_blk(htx, type, blksz);
+	if (!blk)
+		return NULL;
+
+	blk->info += blksz;
+	return blk;
+}
+
 struct htx_blk *htx_add_all_headers(struct htx *htx, const struct http_hdr *hdrs)
 {
 	int i;
@@ -736,22 +811,29 @@ struct htx_blk *htx_add_oob(struct htx *htx, const struct ist oob)
 	return blk;
 }
 
-struct htx_blk *htx_add_data_before(struct htx *htx, const struct htx_blk *ref,
-				    const struct ist data)
-{
-	struct htx_blk *blk;
-	int32_t prev;
 
-	/* FIXME: check data.len (< 256MB) */
-	blk = htx_add_blk(htx, HTX_BLK_DATA, data.len);
+/* Adds an HTX block of type DATA in <htx> just after all other DATA
+ * blocks. Because it relies on htx_add_data(), It may be happened to a DATA
+ * block if possible. But, if the function succeeds, it will be the last DATA
+ * block in all cases. If an error occurred, NULL is returned. Otherwise, on
+ * success, the updated block (or the new one) is returned.
+ */
+struct htx_blk *htx_add_last_data(struct htx *htx, struct ist data)
+{
+	struct htx_blk *blk, *pblk;
+
+	blk = htx_add_data(htx, data);
 	if (!blk)
 		return NULL;
 
-	blk->info += data.len;
-	memcpy(htx_get_blk_ptr(htx, blk), data.ptr, data.len);
+	for (pblk = htx_get_prev_blk(htx, blk); pblk; pblk = htx_get_prev_blk(htx, pblk)) {
+		int32_t cur, prev;
 
-	for (prev = htx_get_prev(htx, htx->tail); prev != -1; prev = htx_get_prev(htx, prev)) {
-		struct htx_blk *pblk = htx_get_blk(htx, prev);
+		if (htx_get_blk_type(pblk) <= HTX_BLK_DATA)
+			break;
+
+		cur  = htx_get_blk_pos(htx, blk);
+		prev = htx_get_blk_pos(htx, pblk);
 
 		/* Swap .addr and .info fields */
 		blk->addr ^= pblk->addr; pblk->addr ^= blk->addr; blk->addr ^= pblk->addr;
@@ -759,12 +841,16 @@ struct htx_blk *htx_add_data_before(struct htx *htx, const struct htx_blk *ref,
 
 		if (blk->addr == pblk->addr)
 			blk->addr += htx_get_blksz(pblk);
-		htx->front = prev;
-
-		if (pblk == ref)
-			break;
 		blk = pblk;
+		if (htx->front == cur)
+			htx->front = prev;
+		else if (htx->front == prev)
+			htx->front = cur;
 	}
+
+	if (htx_get_blk_pos(htx, blk) != htx->front)
+		htx_defrag(htx, NULL);
+
 	return blk;
 }
 
@@ -774,21 +860,31 @@ struct htx_blk *htx_add_data_before(struct htx *htx, const struct htx_blk *ref,
  */
 int htx_reqline_to_h1(const struct htx_sl *sl, struct buffer *chk)
 {
-	if (HTX_SL_LEN(sl) + 4 > b_room(chk))
-		return 0;
+	size_t sz = chk->data;
 
-	chunk_memcat(chk, HTX_SL_REQ_MPTR(sl), HTX_SL_REQ_MLEN(sl));
-	chunk_memcat(chk, " ", 1);
-	chunk_memcat(chk, HTX_SL_REQ_UPTR(sl), HTX_SL_REQ_ULEN(sl));
-	chunk_memcat(chk, " ", 1);
-	if (sl->flags & HTX_SL_F_VER_11)
-		chunk_memcat(chk, "HTTP/1.1", 8);
-	else
-		chunk_memcat(chk, HTX_SL_REQ_VPTR(sl), HTX_SL_REQ_VLEN(sl));
+	if (!chunk_memcat(chk, HTX_SL_REQ_MPTR(sl), HTX_SL_REQ_MLEN(sl)) ||
+	    !chunk_memcat(chk, " ", 1) ||
+	    !chunk_memcat(chk, HTX_SL_REQ_UPTR(sl), HTX_SL_REQ_ULEN(sl)) ||
+	    !chunk_memcat(chk, " ", 1))
+		goto full;
 
-	chunk_memcat(chk, "\r\n", 2);
+	if (sl->flags & HTX_SL_F_VER_11) {
+		if (!chunk_memcat(chk, "HTTP/1.1", 8))
+			goto full;
+	}
+	else {
+		if (!chunk_memcat(chk, HTX_SL_REQ_VPTR(sl), HTX_SL_REQ_VLEN(sl)))
+			goto full;
+	}
+
+	if (!chunk_memcat(chk, "\r\n", 2))
+		goto full;
 
 	return 1;
+
+  full:
+	chk->data = sz;
+	return 0;
 }
 
 /* Appends the H1 representation of the status line block <blk> to the chunk
@@ -797,20 +893,31 @@ int htx_reqline_to_h1(const struct htx_sl *sl, struct buffer *chk)
  */
 int htx_stline_to_h1(const struct htx_sl *sl, struct buffer *chk)
 {
-	if (HTX_SL_LEN(sl) + 4 > b_size(chk))
+	size_t sz = chk->data;
+
+	if (HTX_SL_LEN(sl) + 4 > b_room(chk))
 		return 0;
 
-	if (sl->flags & HTX_SL_F_VER_11)
-		chunk_memcat(chk, "HTTP/1.1", 8);
-	else
-		chunk_memcat(chk, HTX_SL_RES_VPTR(sl), HTX_SL_RES_VLEN(sl));
-	chunk_memcat(chk, " ", 1);
-	chunk_memcat(chk, HTX_SL_RES_CPTR(sl), HTX_SL_RES_CLEN(sl));
-	chunk_memcat(chk, " ", 1);
-	chunk_memcat(chk, HTX_SL_RES_RPTR(sl), HTX_SL_RES_RLEN(sl));
-	chunk_memcat(chk, "\r\n", 2);
+	if (sl->flags & HTX_SL_F_VER_11) {
+		if (!chunk_memcat(chk, "HTTP/1.1", 8))
+			goto full;
+	}
+	else {
+		if (!chunk_memcat(chk, HTX_SL_RES_VPTR(sl), HTX_SL_RES_VLEN(sl)))
+			goto full;
+	}
+	if (!chunk_memcat(chk, " ", 1) ||
+	    !chunk_memcat(chk, HTX_SL_RES_CPTR(sl), HTX_SL_RES_CLEN(sl)) ||
+	    !chunk_memcat(chk, " ", 1) ||
+	    !chunk_memcat(chk, HTX_SL_RES_RPTR(sl), HTX_SL_RES_RLEN(sl)) ||
+	    !chunk_memcat(chk, "\r\n", 2))
+		goto full;
 
 	return 1;
+
+  full:
+	chk->data = sz;
+	return 0;
 }
 
 /* Appends the H1 representation of the header block <blk> to the chunk
@@ -819,15 +926,22 @@ int htx_stline_to_h1(const struct htx_sl *sl, struct buffer *chk)
  */
 int htx_hdr_to_h1(const struct ist n, const struct ist v, struct buffer *chk)
 {
+	size_t sz = chk->data;
+
 	if (n.len + v.len + 4 > b_room(chk))
 		return 0;
 
-	chunk_memcat(chk, n.ptr, n.len);
-	chunk_memcat(chk, ": ", 2);
-	chunk_memcat(chk, v.ptr, v.len);
-	chunk_memcat(chk, "\r\n", 2);
+	if (!chunk_memcat(chk, n.ptr, n.len) ||
+	    !chunk_memcat(chk, ": ", 2) ||
+	    !chunk_memcat(chk, v.ptr, v.len) ||
+	    !chunk_memcat(chk, "\r\n", 2))
+		goto full;
 
 	return 1;
+
+  full:
+	chk->data = sz;
+	return 0;
 }
 
 /* Appends the H1 representation of the data block <blk> to the chunk
@@ -836,6 +950,8 @@ int htx_hdr_to_h1(const struct ist n, const struct ist v, struct buffer *chk)
  */
 int htx_data_to_h1(const struct ist data, struct buffer *chk, int chunked)
 {
+	size_t sz = chk->data;
+
 	if (chunked) {
 		uint32_t chksz;
 		char     tmp[10];
@@ -850,11 +966,10 @@ int htx_data_to_h1(const struct ist data, struct buffer *chk, int chunked)
 			*--beg = hextab[chksz & 0xF];
 		} while (chksz >>= 4);
 
-		if (data.len + (end - beg) + 2 > b_room(chk))
-			return 0;
-		chunk_memcat(chk, beg, end - beg);
-		chunk_memcat(chk, data.ptr, data.len);
-		chunk_memcat(chk, "\r\n", 2);
+		if (!chunk_memcat(chk, beg, end - beg) ||
+		    !chunk_memcat(chk, data.ptr, data.len) ||
+		    !chunk_memcat(chk, "\r\n", 2))
+			goto full;
 	}
 	else {
 		if (!chunk_memcat(chk, data.ptr, data.len))
@@ -862,6 +977,10 @@ int htx_data_to_h1(const struct ist data, struct buffer *chk, int chunked)
 	}
 
 	return 1;
+
+  full:
+	chk->data = sz;
+	return 0;
 }
 
 /* Appends the h1 representation of the trailer block <blk> to the chunk

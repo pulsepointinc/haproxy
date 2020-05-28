@@ -4,7 +4,7 @@
                          ----------------------
                               version 1.9
                              willy tarreau
-                              2018/12/19
+                              2020/04/02
 
 
 This document covers the configuration language as implemented in the version
@@ -185,7 +185,7 @@ waiting for new requests, just as if it was a keep-alive HTTP connection.
 HAProxy supports 4 connection modes :
   - keep alive    : all requests and responses are processed (default)
   - tunnel        : only the first request and response are processed,
-                    everything else is forwarded with no analysis.
+                    everything else is forwarded with no analysis (deprecated).
   - server close  : the server-facing connection is closed after the response.
   - close         : the connection is actively closed after end of response.
 
@@ -580,6 +580,7 @@ The following keywords are supported in the "global" section :
    - uid
    - ulimit-n
    - user
+   - set-dumpable
    - setenv
    - stats
    - ssl-default-bind-ciphers
@@ -804,6 +805,10 @@ gid <number>
   will only be able to drop these groups if started with superuser privileges.
   See also "group" and "uid".
 
+group <group name>
+  Similar to "gid" but uses the GID of group name <group name> from /etc/group.
+  See also "gid" and "user".
+
 hard-stop-after <time>
   Defines the maximum time allowed to perform a clean soft-stop.
 
@@ -958,14 +963,14 @@ nbproc <number>
   mode. By default, only one process is created, which is the recommended mode
   of operation. For systems limited to small sets of file descriptors per
   process, it may be needed to fork multiple daemons. USING MULTIPLE PROCESSES
-  IS HARDER TO DEBUG AND IS REALLY DISCOURAGED. See also "daemon".
+  IS HARDER TO DEBUG AND IS REALLY DISCOURAGED. See also "daemon" and
+  "nbthread".
 
 nbthread <number>
   This setting is only available when support for threads was built in. It
   creates <number> threads for each created processes. It means if HAProxy is
   started in foreground, it only creates <number> threads for the first
-  process. FOR NOW, THREADS SUPPORT IN HAPROXY IS HIGHLY EXPERIMENTAL AND IT
-  MUST BE ENABLED WITH CAUTION AND AT YOUR OWN RISK. See also "nbproc".
+  process. See also "nbproc".
 
 pidfile <pidfile>
   Writes PIDs of all daemons into file <pidfile>. This option is equivalent to
@@ -1024,15 +1029,36 @@ setenv <name> <value>
   the configuration file sees the new value. See also "presetenv", "resetenv",
   and "unsetenv".
 
+set-dumpable
+  This option is better left disabled by default and enabled only upon a
+  developer's request. It has no impact on performance nor stability but will
+  try hard to re-enable core dumps that were possibly disabled by file size
+  limitations (ulimit -f), core size limitations (ulimit -c), or "dumpability"
+  of a process after changing its UID/GID (such as /proc/sys/fs/suid_dumpable
+  on Linux). Core dumps might still be limited by the current directory's
+  permissions (check what directory the file is started from), the chroot
+  directory's permission (it may be needed to temporarily disable the chroot
+  directive or to move it to a dedicated writable location), or any other
+  system-specific constraint. For example, some Linux flavours are notorious
+  for replacing the default core file with a path to an executable not even
+  installed on the system (check /proc/sys/kernel/core_pattern). Often, simply
+  writing "core", "core.%p" or "/var/log/core/core.%p" addresses the issue.
+  When trying to enable this option waiting for a rare issue to re-appear, it's
+  often a good idea to first try to obtain such a dump by issuing, for example,
+  "kill -11" to the haproxy process and verify that it leaves a core where
+  expected when dying.
+
 ssl-default-bind-ciphers <ciphers>
   This setting is only available when support for OpenSSL was built in. It sets
   the default string describing the list of cipher algorithms ("cipher suite")
-  that are negotiated during the SSL/TLS handshake except for TLSv1.3 for all
+  that are negotiated during the SSL/TLS handshake up to TLSv1.2 for all
   "bind" lines which do not explicitly define theirs. The format of the string
-  is defined in "man 1 ciphers" from OpenSSL man pages, and can be for instance
-  a string such as "AES:ALL:!aNULL:!eNULL:+RC4:@STRENGTH" (without quotes). For
-  TLSv1.3 cipher configuration, please check the "ssl-default-bind-ciphersuites"
-  keyword. Please check the "bind" keyword for more information.
+  is defined in "man 1 ciphers" from OpenSSL man pages. For background
+  information and recommendations see e.g.
+  (https://wiki.mozilla.org/Security/Server_Side_TLS) and
+  (https://mozilla.github.io/server-side-tls/ssl-config-generator/). For TLSv1.3
+  cipher configuration, please check the "ssl-default-bind-ciphersuites" keyword.
+  Please check the "bind" keyword for more information.
 
 ssl-default-bind-ciphersuites <ciphersuites>
   This setting is only available when support for OpenSSL was built in and
@@ -1040,11 +1066,9 @@ ssl-default-bind-ciphersuites <ciphersuites>
   describing the list of cipher algorithms ("cipher suite") that are negotiated
   during the TLSv1.3 handshake for all "bind" lines which do not explicitly define
   theirs. The format of the string is defined in
-  "man 1 ciphers" from OpenSSL man pages under the section "ciphersuites", and can
-  be for instance a string such as
-  "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256"
-  (without quotes). For cipher configuration for TLSv1.2 and earlier, please check
-  the "ssl-default-bind-ciphers" keyword. Please check the "bind" keyword for more
+  "man 1 ciphers" from OpenSSL man pages under the section "ciphersuites". For
+  cipher configuration for TLSv1.2 and earlier, please check the
+  "ssl-default-bind-ciphers" keyword. Please check the "bind" keyword for more
   information.
 
 ssl-default-bind-options [<option>]...
@@ -1059,11 +1083,15 @@ ssl-default-bind-options [<option>]...
 ssl-default-server-ciphers <ciphers>
   This setting is only available when support for OpenSSL was built in. It
   sets the default string describing the list of cipher algorithms that are
-  negotiated during the SSL/TLS handshake except for TLSv1.3 with the server,
+  negotiated during the SSL/TLS handshake up to TLSv1.2 with the server,
   for all "server" lines which do not explicitly define theirs. The format of
-  the string is defined in "man 1 ciphers". For TLSv1.3 cipher configuration,
-  please check the "ssl-default-server-ciphersuites" keyword. Please check the
-  "server" keyword for more information.
+  the string is defined in "man 1 ciphers" from OpenSSL man pages. For background
+  information and recommendations see e.g.
+  (https://wiki.mozilla.org/Security/Server_Side_TLS) and
+  (https://mozilla.github.io/server-side-tls/ssl-config-generator/).
+  For TLSv1.3 cipher configuration, please check the
+  "ssl-default-server-ciphersuites" keyword. Please check the "server" keyword
+  for more information.
 
 ssl-default-server-ciphersuites <ciphersuites>
   This setting is only available when support for OpenSSL was built in and
@@ -1071,9 +1099,10 @@ ssl-default-server-ciphersuites <ciphersuites>
   string describing the list of cipher algorithms that are negotiated during
   the TLSv1.3 handshake with the server, for all "server" lines which do not
   explicitly define theirs. The format of the string is defined in
-  "man 1 ciphers" under the "ciphersuites" section. For cipher configuration for
-  TLSv1.2 and earlier, please check the "ssl-default-server-ciphers" keyword.
-  Please check the "server" keyword for more information.
+  "man 1 ciphers" from OpenSSL man pages under the section "ciphersuites". For
+  cipher configuration for TLSv1.2 and earlier, please check the
+  "ssl-default-server-ciphers" keyword. Please check the "server" keyword for
+  more information.
 
 ssl-default-server-options [<option>]...
   This setting is only available when support for OpenSSL was built in. It sets
@@ -1689,7 +1718,8 @@ tune.pattern.cache-size <number>
   configuration line (including all those loaded from files). It automatically
   invalidates entries which are updated using HTTP actions or on the CLI. The
   default cache size is set to 10000 entries, which limits its footprint to
-  about 5 MB on 32-bit systems and 8 MB on 64-bit systems. There is a very low
+  about 5 MB per process/thread on 32-bit systems and 8 MB per process/thread
+  on 64-bit systems, as caches are thread/process local. There is a very low
   risk of collision in this cache, which is in the order of the size of the
   cache divided by 2^64. Typically, at 10000 requests per second with the
   default cache size of 10000 entries, there's 1% chance that a brute force
@@ -2062,8 +2092,10 @@ the backend's. HAProxy supports 4 connection modes :
   - TUN: tunnel ("option http-tunnel") : this was the default mode for versions
     1.0 to 1.5-dev21 : only the first request and response are processed, and
     everything else is forwarded with no analysis at all. This mode should not
-    be used as it creates lots of trouble with logging and HTTP processing. It
-    is supported only on frontends.
+    be used as it creates lots of trouble with logging and HTTP processing.
+    And because it cannot work in HTTP/2, this option is deprecated and it is
+    only supported on legacy HTTP frontends. In HTX, it is ignored and a
+    warning is emitted during HAProxy startup.
 
   - SCL: server close ("option http-server-close") : the server-facing
     connection is closed after the end of the response is received, but the
@@ -2172,7 +2204,7 @@ option clitcpka                      (*)  X          X         X         -
 option contstats                     (*)  X          X         X         -
 option dontlog-normal                (*)  X          X         X         -
 option dontlognull                   (*)  X          X         X         -
-option forceclose      (deprectated) (*)  X          X         X         X
+option forceclose       (deprecated) (*)  X          X         X         X
 -- keyword -------------------------- defaults - frontend - listen -- backend -
 option forwardfor                         X          X         X         X
 option http-buffer-request           (*)  X          X         X         X
@@ -2181,12 +2213,12 @@ option http-keep-alive               (*)  X          X         X         X
 option http-no-delay                 (*)  X          X         X         X
 option http-pretend-keepalive        (*)  X          -         X         X
 option http-server-close             (*)  X          X         X         X
-option http-tunnel                   (*)  X          X         X         -
+option http-tunnel      (deprecated) (*)  X          X         X         -
 option http-use-proxy-header         (*)  X          X         X         -
 option http-use-htx                  (*)  X          X         X         X
 option httpchk                            X          -         X         X
 option httpclose                     (*)  X          X         X         X
-option httplog                            X          X         X         X
+option httplog                            X          X         X         -
 option http_proxy                    (*)  X          X         X         X
 option independent-streams           (*)  X          X         X         X
 option ldap-check                         X          -         X         X
@@ -3044,9 +3076,7 @@ compression offload
     * the request does not advertise a supported compression algorithm in the
       "Accept-Encoding" header
     * the response message is not HTTP/1.1
-    * HTTP status code is not 200
-    * response header "Transfer-Encoding" contains "chunked" (Temporary
-      Workaround)
+    * HTTP status code is not one of 200, 201, 202, or 203
     * response contain neither a "Content-Length" header nor a
       "Transfer-Encoding" whose last value is "chunked"
     * response contains a "Content-Type" header whose first value starts with
@@ -3057,9 +3087,9 @@ compression offload
       and later
     * The response contains a "Content-Encoding" header, indicating that the
       response is already compressed (see compression offload)
+    * The response contains an invalid "ETag" header or multiple ETag headers
 
-  Note: The compression does not rewrite Etag headers, and does not emit the
-        Warning header.
+  Note: The compression does not emit the Warning header.
 
   Examples :
         compression algo gzip
@@ -3101,7 +3131,7 @@ contimeout <timeout> (deprecated)
 cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
               [ postonly ] [ preserve ] [ httponly ] [ secure ]
               [ domain <domain> ]* [ maxidle <idle> ] [ maxlife <life> ]
-              [ dynamic ]
+              [ dynamic ] [ attr <value> ]*
   Enable cookie-based persistence in a backend.
   May be used in sections :   defaults | frontend | listen | backend
                                  yes   |    no    |   yes  |   yes
@@ -3133,7 +3163,7 @@ cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
 
               already have a cookie that would have permitted it to access this
               server. When used without the "preserve" option, if the server
-              emits a cookie with the same name, it will be remove before
+              emits a cookie with the same name, it will be removed before
               processing. For this reason, this mode can be used to upgrade
               existing configurations running in the "rewrite" mode. The cookie
               will only be a session cookie and will not be stored on the
@@ -3259,6 +3289,11 @@ cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
               "dynamic-cookie-key" backend directive.
               The cookie will be regenerated each time the IP address change,
               and is only generated for IPv4/IPv6.
+
+    attr      This option tells haproxy to add an extra attribute when a
+              cookie is inserted. The attribute value can contain any
+              characters except control ones or ";". This option may be
+              repeated.
 
   There can be only one persistence cookie per HTTP backend, and it can be
   declared in a defaults section. The value of the cookie will be the value
@@ -3742,7 +3777,7 @@ hash-balance-factor <factor>
   Arguments :
     <factor> is the control for the maximum number of concurrent requests to
              send to a server, expressed as a percentage of the average number
-	     of concurrent requests across all of the active servers.
+             of concurrent requests across all of the active servers.
 
   Specifying a "hash-balance-factor" for a server with "hash-type consistent"
   enables an algorithm that prevents any one server from getting too many
@@ -4109,7 +4144,7 @@ http-request auth [realm <realm>] [ { if | unless } <condition> ]
         acl auth_ok http_auth_group(L1) G1
         http-request auth unless auth_ok
 
-http-request cache-use [ { if | unless } <condition> ]
+http-request cache-use <name> [ { if | unless } <condition> ]
 
   See section 10.2 about cache setup.
 
@@ -4129,9 +4164,12 @@ http-request capture <sample> [ len <length> | id <id> ]
   If the keyword "id" is used instead of "len", the action tries to store the
   captured string in a previously declared capture slot. This is useful to run
   captures in backends. The slot id can be declared by a previous directive
-  "http-request capture" or with the "declare capture" keyword. If the slot
-  <id> doesn't exist, then HAProxy fails parsing the configuration to prevent
-  unexpected behavior at run time.
+  "http-request capture" or with the "declare capture" keyword.
+
+  When using this action in a backend, double check that the relevant
+  frontend(s) have the required capture slots otherwise, this rule will be
+  ignored at run time. This can't be detected at configuration parsing time
+  due to HAProxy's ability to dynamically resolve backend name at runtime.
 
 http-request del-acl(<file-name>) <key fmt> [ { if | unless } <condition> ]
 
@@ -4578,6 +4616,21 @@ http-request unset-var(<var-name>) [ { if | unless } <condition> ]
   Example:
     http-request unset-var(req.my_var)
 
+http-request use-service <service-name> [ { if | unless } <condition> ]
+
+  This directive executes the configured HTTP service to reply to the request
+  and stops the evaluation of the rules. An HTTP service may choose to reply by
+  sending any valid HTTP response or it may immediately close the connection
+  without sending any response. Outside natives services, for instance the
+  Prometheus exporter, it is possible to write your own services in Lua. No
+  further "http-request" rules are evaluated.
+
+  Arguments :
+    <service-name>  is mandatory. It is the service to call
+
+  Example:
+    http-request use-service prometheus-exporter if { path /metrics }
+
 http-request wait-for-handshake [ { if | unless } <condition> ]
 
   This will delay the processing of the request until the SSL handshake
@@ -4658,7 +4711,7 @@ http-response allow [ { if | unless } <condition> ]
   This stops the evaluation of the rules and lets the response pass the check.
   No further "http-response" rules are evaluated for the current section.
 
-http-response cache-store [ { if | unless } <condition> ]
+http-response cache-store <name> [ { if | unless } <condition> ]
 
   See section 10.2 about cache setup.
 
@@ -4677,8 +4730,11 @@ http-response capture <sample> id <id> [ { if | unless } <condition> ]
   This is useful to run captures in backends. The slot id can be declared by a
   previous directive "http-response capture" or with the "declare capture"
   keyword.
-  If the slot <id> doesn't exist, then HAProxy fails parsing the configuration
-  to prevent unexpected behavior at run time.
+
+  When using this action in a backend, double check that the relevant
+  frontend(s) have the required capture slots otherwise, this rule will be
+  ignored at run time. This can't be detected at configuration parsing time
+  due to HAProxy's ability to dynamically resolve backend name at runtime.
 
 http-response del-acl(<file-name>) <key fmt> [ { if | unless } <condition> ]
 
@@ -4962,7 +5018,7 @@ http-reuse { never | safe | aggressive | always }
                  proving that the server correctly supports connection reuse.
                  It should only be used when it's sure that the client can
                  retry a failed request once in a while and where the benefit
-                 of aggressive connection reuse significantly outweights the
+                 of aggressive connection reuse significantly outweighs the
                  downsides of rare connection failures.
 
     - "always" : this mode is only recommended when the path to the server is
@@ -4989,9 +5045,7 @@ http-reuse { never | safe | aggressive | always }
     - connections with certain bogus authentication schemes (relying on the
       connection) like NTLM are detected, marked private and are never shared;
 
-  No connection pool is involved, once a session dies, the last idle connection
-  it was attached to is deleted at the same time. This ensures that connections
-  may not last after all sessions are closed.
+  A connection pool is involved and configurable with "pool-max-conn".
 
   Note: connection reuse improves the accuracy of the "server maxconn" setting,
   because almost no new connection will be established while idle connections
@@ -5002,17 +5056,27 @@ http-reuse { never | safe | aggressive | always }
 
 http-send-name-header [<header>]
   Add the server name to a request. Use the header string given by <header>
-
   May be used in sections:   defaults | frontend | listen | backend
                                yes    |    no    |   yes  |   yes
-
   Arguments :
-
     <header>  The header string to use to send the server name
 
-  The "http-send-name-header" statement causes the name of the target
-  server to be added to the headers of an HTTP request. The name
-  is added with the header string proved.
+  The "http-send-name-header" statement causes the header field named <header>
+  to be set to the name of the target server at the moment the request is about
+  to be sent on the wire. Any existing occurrences of this header are removed.
+  Upon retries and redispatches, the header field is updated to always reflect
+  the server being attempted to connect to. Given that this header is modified
+  very late in the connection setup, it may have unexpected effects on already
+  modified headers. For example using it with transport-level header such as
+  connection, content-length, transfer-encoding and so on will likely result in
+  invalid requests being sent to the server. Additionally it has been reported
+  that this directive is currently being used as a way to overwrite the Host
+  header field in outgoing requests; while this trick has been known to work
+  as a side effect of the feature for some time, it is not officially supported
+  and might possibly not work anymore in a future version depending on the
+  technical difficulties this feature induces. A long-term solution instead
+  consists in fixing the application which required this trick so that it binds
+  to the correct host name.
 
   See also : "server"
 
@@ -6018,7 +6082,7 @@ no option http-keep-alive
 
   See also : "option httpclose",, "option http-server-close",
              "option prefer-last-server", "option http-pretend-keepalive",
-	     and "1.1. The HTTP transaction model".
+             and "1.1. The HTTP transaction model".
 
 
 option http-no-delay
@@ -6143,12 +6207,16 @@ no option http-server-close
              "option http-keep-alive", and "1.1. The HTTP transaction model".
 
 
-option http-tunnel
-no option http-tunnel
-  Disable or enable HTTP connection processing after first transaction
+option http-tunnel    (deprecated)
+no option http-tunnel (deprecated)
+  Disable or enable HTTP connection processing after first transaction.
   May be used in sections :   defaults | frontend | listen | backend
                                  yes   |    yes   |   yes  |   no
   Arguments : none
+
+  Warning : Because it cannot work in HTTP/2, this option is deprecated and it
+  is only supported on legacy HTTP frontends. In HTX, it is ignored and a
+  warning is emitted during HAProxy startup.
 
   By default HAProxy operates in keep-alive mode with regards to persistent
   connections: for each connection it processes each request and response, and
@@ -6764,8 +6832,8 @@ no option redispatch
   definitely stick to it because they cannot flush the cookie, so they will not
   be able to access the service anymore.
 
-  Specifying "option redispatch" will allow the proxy to break their
-  persistence and redistribute them to a working server.
+  Specifying "option redispatch" will allow the proxy to break cookie or
+  consistent hash based persistence and redistribute them to a working server.
 
   It also allows to retry connections to another server in case of multiple
   connection failures. Of course, it requires having "retries" set to a nonzero
@@ -8016,7 +8084,7 @@ server-state-file-name [<file>]
     global
       server-state-file-base /etc/haproxy/states
 
-   backend bk
+    backend bk
       load-server-state-from-file
 
   See also: "server-state-file-base", "load-server-state-from-file", and
@@ -9706,6 +9774,7 @@ tcp-request content <action> [{if | unless} <condition>]
     - unset-var(<var-name>)
     - silent-drop
     - send-spoe-group <engine-name> <group-name>
+    - use-service <service-name>
 
   They have the same meaning as their counter-parts in "tcp-request connection"
   so please refer to that section for a complete description.
@@ -9786,6 +9855,16 @@ tcp-request content <action> [{if | unless} <condition>]
     <engine-name> The SPOE engine name.
 
     <group-name>  The SPOE group name as specified in the engine configuration.
+
+  The "use-service" is used to executes a TCP service which will reply to the
+  request and stop the evaluation of the rules. This service may choose to
+  reply by sending any valid response or it may immediately close the
+  connection without sending anything. Outside natives services, it is possible
+  to write your own services in Lua. No further "tcp-request" rules are
+  evaluated.
+
+  Example:
+    tcp-request content use-service lua.deny { src -f /etc/haproxy/blacklist.lst }
 
   Example:
 
@@ -10768,7 +10847,10 @@ accept-proxy
 
 allow-0rtt
   Allow receiving early data when using TLSv1.3. This is disabled by default,
-  due to security considerations.
+  due to security considerations. Because it is vulnerable to replay attacks,
+  you should only allow if for requests that are safe to replay, ie requests
+  that are idempotent. You can use the "wait-for-handshake" action for any
+  request that wouldn't be safe with early data.
 
 alpn <protocols>
   This enables the TLS ALPN extension and advertises the specified protocol
@@ -10830,11 +10912,8 @@ ca-sign-pass <passphrase>
 ciphers <ciphers>
   This setting is only available when support for OpenSSL was built in. It sets
   the string describing the list of cipher algorithms ("cipher suite") that are
-  negotiated during the SSL/TLS handshake except for TLSv1.3. The format of the
-  string is defined in "man 1 ciphers" from OpenSSL man pages, and can be for
-  instance a string such as "AES:ALL:!aNULL:!eNULL:+RC4:@STRENGTH" (without
-  quotes). Depending on the compatibility and security requirements, the list
-  of suitable ciphers depends on a variety of variables. For background
+  negotiated during the SSL/TLS handshake up to TLSv1.2. The format of the
+  string is defined in "man 1 ciphers" from OpenSSL man pages. For background
   information and recommendations see e.g.
   (https://wiki.mozilla.org/Security/Server_Side_TLS) and
   (https://mozilla.github.io/server-side-tls/ssl-config-generator/). For TLSv1.3
@@ -10845,11 +10924,8 @@ ciphersuites <ciphersuites>
   OpenSSL 1.1.1 or later was used to build HAProxy. It sets the string describing
   the list of cipher algorithms ("cipher suite") that are negotiated during the
   TLSv1.3 handshake. The format of the string is defined in "man 1 ciphers" from
-  OpenSSL man pages under the "ciphersuites" section, and can be for instance a
-  string such as
-  "TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256"
-  (without quotes). For cipher configuration for TLSv1.2 and earlier, please check
-  the "ciphers" keyword.
+  OpenSSL man pages under the "ciphersuites" section. For cipher configuration
+  for TLSv1.2 and earlier, please check the "ciphers" keyword.
 
 crl-file <crlfile>
   This setting is only available when support for OpenSSL was built in. It
@@ -11195,6 +11271,9 @@ no-tls-tickets
   extension) and force to use stateful session resumption. Stateless
   session resumption is more expensive in CPU usage. This option is also
   available on global statement "ssl-default-bind-options".
+  The TLS ticket mechanism is only used up to TLS 1.2.
+  Forward Secrecy is compromised with TLS tickets, unless ticket keys
+  are periodically rotated (via reload or by using "tls-ticket-keys").
 
 no-tlsv10
   This setting is only available when support for OpenSSL was built in. It
@@ -11334,13 +11413,16 @@ tfo
 
 tls-ticket-keys <keyfile>
   Sets the TLS ticket keys file to load the keys from. The keys need to be 48
-  bytes long, encoded with base64 (ex. openssl rand -base64 48). Number of keys
-  is specified by the TLS_TICKETS_NO build option (default 3) and at least as
-  many keys need to be present in the file. Last TLS_TICKETS_NO keys will be
-  used for decryption and the penultimate one for encryption. This enables easy
-  key rotation by just appending new key to the file and reloading the process.
-  Keys must be periodically rotated (ex. every 12h) or Perfect Forward Secrecy
-  is compromised. It is also a good idea to keep the keys off any permanent
+  or 80 bytes long, depending if aes128 or aes256 is used, encoded with base64
+  with one line per key (ex. openssl rand 80 | openssl base64 -A | xargs echo).
+  The first key determines the key length used for next keys: you can't mix
+  aes128 and aes256 keys. Number of keys is specified by the TLS_TICKETS_NO
+  build option (default 3) and at least as many keys need to be present in
+  the file. Last TLS_TICKETS_NO keys will be used for decryption and the
+  penultimate one for encryption. This enables easy key rotation by just
+  appending new key to the file and reloading the process.  Keys must be
+  periodically rotated (ex. every 12h) or Perfect Forward Secrecy is
+  compromised. It is also a good idea to keep the keys off any permanent
   storage such as hard drives (hint: use tmpfs and don't swap those files).
   Lifetime hint can be changed using tune.ssl.timeout.
 
@@ -11519,6 +11601,10 @@ agent-port <port>
 
   See also the "agent-check" and "agent-inter" parameters.
 
+allow-0rtt
+  Allow sending early data to the server when using TLS 1.3.
+  Note that early data will be sent only if the client used early data.
+
 alpn <protocols>
   This enables the TLS ALPN extension and advertises the specified protocol
   list as supported on top of ALPN. The protocol list consists in a comma-
@@ -11569,6 +11655,11 @@ check-send-proxy
   "check-send-proxy" option needs to be used to force the use of the
   protocol. See also the "send-proxy" option for more information.
 
+check-alpn <protocols>
+  Defines which protocols to advertise with ALPN. The protocol list consists in
+  a comma-delimited list of protocol names, for instance: "http/1.1,http/1.0"
+  (without quotes). If it is not set, the server ALPN is used.
+
 check-sni <sni>
   This option allows you to specify the SNI to be used when doing health checks
   over SSL. It is only possible to use a string to set <sni>. If you want to
@@ -11590,19 +11681,20 @@ ciphers <ciphers>
   This setting is only available when support for OpenSSL was built in. This
   option sets the string describing the list of cipher algorithms that is
   negotiated during the SSL/TLS handshake with the server. The format of the
-  string is defined in "man 1 ciphers". When SSL is used to communicate with
-  servers on the local network, it is common to see a weaker set of algorithms
-  than what is used over the internet. Doing so reduces CPU usage on both the
-  server and haproxy while still keeping it compatible with deployed software.
-  Some algorithms such as RC4-SHA1 are reasonably cheap. If no security at all
-  is needed and just connectivity, using DES can be appropriate.
+  string is defined in "man 1 ciphers" from OpenSSL man pages. For background
+  information and recommendations see e.g.
+  (https://wiki.mozilla.org/Security/Server_Side_TLS) and
+  (https://mozilla.github.io/server-side-tls/ssl-config-generator/). For TLSv1.3
+  cipher configuration, please check the "ciphersuites" keyword.
 
 ciphersuites <ciphersuites>
   This setting is only available when support for OpenSSL was built in and
   OpenSSL 1.1.1 or later was used to build HAProxy. This option sets the string
   describing the list of cipher algorithms that is negotiated during the TLS
   1.3 handshake with the server. The format of the string is defined in
-  "man 1 ciphers" under the "ciphersuites" section.
+  "man 1 ciphers" from OpenSSL man pages under the "ciphersuites" section.
+  For cipher configuration for TLSv1.2 and earlier, please check the "ciphers"
+  keyword.
 
 cookie <value>
   The "cookie" parameter sets the cookie value assigned to the server to
@@ -11743,12 +11835,18 @@ downinter <delay>
 maxconn <maxconn>
   The "maxconn" parameter specifies the maximal number of concurrent
   connections that will be sent to this server. If the number of incoming
-  concurrent requests goes higher than this value, they will be queued, waiting
-  for a connection to be released. This parameter is very important as it can
+  concurrent connections goes higher than this value, they will be queued,
+  waiting for a slot to be released. This parameter is very important as it can
   save fragile servers from going down under extreme loads. If a "minconn"
   parameter is specified, the limit becomes dynamic. The default value is "0"
   which means unlimited. See also the "minconn" and "maxqueue" parameters, and
   the backend's "fullconn" keyword.
+
+  In HTTP mode this parameter limits the number of concurrent requests instead
+  of the number of connections. Multiple requests might be multiplexed over a
+  single TCP connection to the server. As an example if you specify a maxconn
+  of 50 you might see between 1 and 50 actual server connections, but no more
+  than 50 concurrent requests.
 
 maxqueue <maxqueue>
   The "maxqueue" parameter specifies the maximal number of connections which
@@ -11758,6 +11856,16 @@ maxqueue <maxqueue>
   quickly re-log in when the server they try to connect to is dying. The
   default value is "0" which means the queue is unlimited. See also the
   "maxconn" and "minconn" parameters.
+
+max-reuse <count>
+  The "max-reuse" argument indicates the HTTP connection processors that they
+  should not reuse a server connection more than this number of times to send
+  new requests. Permitted values are -1 (the default), which disables this
+  limit, or any positive value. Value zero will effectively disable keep-alive.
+  This is only used to work around certain server bugs which cause them to leak
+  resources over time. The argument is not necessarily respected by the lower
+  layers as there might be technical limitations making it impossible to
+  enforce. At least HTTP/2 connections to servers will respect it.
 
 minconn <minconn>
   When the "minconn" parameter is set, the maxconn limit becomes a dynamic
@@ -11857,6 +11965,9 @@ no-tls-tickets
   extension) and force to use stateful session resumption. Stateless
   session resumption is more expensive in CPU usage for servers. This option
   is also available on global statement "ssl-default-server-options".
+  The TLS ticket mechanism is only used up to TLS 1.2.
+  Forward Secrecy is compromised with TLS tickets, unless ticket keys
+  are periodically rotated (via reload or by using "tls-ticket-keys").
   See also "tls-tickets".
 
 no-tlsv10
@@ -11980,8 +12091,8 @@ pool-max-conn <max>
 
 pool-purge-delay <delay>
   Sets the delay to start purging idle connections. Each <delay> interval, half
-  of the idle connections are closed. 0 means it's never purged. The default is
-  1s.
+  of the idle connections are closed. 0 means we don't keep any idle connection.
+  The default is 1s.
 
 port <port>
   Using the "port" parameter, it becomes possible to use a different port to
@@ -12261,8 +12372,11 @@ tls-tickets
   This option may be used as "server" setting to reset any "no-tls-tickets"
   setting which would have been inherited from "default-server" directive as
   default value.
+  The TLS ticket mechanism is only used up to TLS 1.2.
+  Forward Secrecy is compromised with TLS tickets, unless ticket keys
+  are periodically rotated (via reload or by using "tls-ticket-keys").
   It may also be used as "default-server" setting to reset any previous
-  "default-server" "no-tlsv-tickets" setting.
+  "default-server" "no-tls-tickets" setting.
 
 verify [none|required]
   This setting is only available when support for OpenSSL was built in. If set
@@ -12452,11 +12566,11 @@ timeout <event> <time>
   Defines timeouts related to name resolution
      <event> : the event on which the <time> timeout period applies to.
                events available are:
-	       - resolve : default time to trigger name resolutions when no
-	                   other time applied.
+               - resolve : default time to trigger name resolutions when no
+                           other time applied.
                            Default value: 1s
                - retry   : time between two DNS queries, when no valid response
-	                   have been received.
+                           have been received.
                            Default value: 1s
      <time>  : time related to the event. It follows the HAProxy time format.
                <time> is expressed in milliseconds.
@@ -12944,6 +13058,14 @@ characters such as the space. If the "-i" flag is passed before the first
 string, then the matching will be performed ignoring the case. In order
 to match the string "-i", either set it second, or pass the "--" flag
 before the first string. Same applies of course to match the string "--".
+
+Do not use string matches for binary fetches which might contain null bytes
+(0x00), as the comparison stops at the occurrence of the first null byte.
+Instead, convert the binary fetch to a hex string with the hex converter first.
+
+Example:
+    # matches if the string <tag> is present in the binary sample
+    acl tag_found req.payload(0,0),hex -m sub 3C7461673E
 
 
 7.1.4. Matching regular expressions (regexes)
@@ -13876,6 +13998,7 @@ word(<index>,<delimiters>[,<count>])
   Extracts the nth word counting from the beginning (positive index) or from
   the end (negative index) considering given delimiters from an input string.
   Indexes start at 1 or -1 and delimiters are a string formatted list of chars.
+  Delimiters at the beginning or end of the input string are ignored.
   Optionally you can specify <count> of words to extract (default: 1).
   Value of 0 indicates extraction of all remaining words.
 
@@ -13885,6 +14008,7 @@ word(<index>,<delimiters>[,<count>])
       str(f1_f2_f3__f5),word(3,_,2)  # f3__f5
       str(f1_f2_f3__f5),word(-2,_,3) # f1_f2_f3
       str(f1_f2_f3__f5),word(-3,_,0) # f1_f2
+      str(/f1/f2/f3/f4),word(1,/)    # f1
 
 wt6([<avalanche>])
   Hashes a binary input sample into an unsigned 32-bit quantity using the WT6
@@ -14367,7 +14491,7 @@ table may be specified with the "sc*" form, in which case the currently
 tracked key will be looked up into this alternate table instead of the table
 currently being tracked.
 
-bc_http_major: integer
+bc_http_major : integer
   Returns the backend connection's HTTP major version encoding, which may be 1
   for HTTP/0.9 to HTTP/1.1 or 2 for HTTP/2. Note, this is based on the on-wire
   encoding and not the version present in the request header.
@@ -14385,7 +14509,12 @@ dst : ip
   which is the address the client connected to. It can be useful when running
   in transparent mode. It is of type IP and works on both IPv4 and IPv6 tables.
   On IPv6 tables, IPv4 address is mapped to its IPv6 equivalent, according to
-  RFC 4291.
+  RFC 4291. When the incoming connection passed through address translation or
+  redirection involving connection tracking, the original destination address
+  before the redirection will be reported. On Linux systems, the source and
+  destination may seldom appear reversed if the nf_conntrack_tcp_loose sysctl
+  is set, because a late response may reopen a timed out connection and switch
+  what is believed to be the source and the destination.
 
 dst_conn : integer
   Returns an integer value corresponding to the number of currently established
@@ -14440,37 +14569,37 @@ fc_rttvar(<unit>) : integer
   operating system does not support TCP_INFO, for example Linux kernels before
   2.4, the sample fetch fails.
 
-fc_unacked(<unit>) : integer
+fc_unacked : integer
   Returns the unacked counter measured by the kernel for the client connection.
   If the server connection is not established, if the connection is not TCP or
   if the operating system does not support TCP_INFO, for example Linux kernels
   before 2.4, the sample fetch fails.
 
-fc_sacked(<unit>) : integer
+fc_sacked : integer
   Returns the sacked counter measured by the kernel for the client connection.
   If the server connection is not established, if the connection is not TCP or
   if the operating system does not support TCP_INFO, for example Linux kernels
   before 2.4, the sample fetch fails.
 
-fc_retrans(<unit>) : integer
+fc_retrans : integer
   Returns the retransmits counter measured by the kernel for the client
   connection. If the server connection is not established, if the connection is
   not TCP or if the operating system does not support TCP_INFO, for example
   Linux kernels before 2.4, the sample fetch fails.
 
-fc_fackets(<unit>) : integer
+fc_fackets : integer
   Returns the fack counter measured by the kernel for the client
   connection. If the server connection is not established, if the connection is
   not TCP or if the operating system does not support TCP_INFO, for example
   Linux kernels before 2.4, the sample fetch fails.
 
-fc_lost(<unit>) : integer
+fc_lost : integer
   Returns the lost counter measured by the kernel for the client
   connection. If the server connection is not established, if the connection is
   not TCP or if the operating system does not support TCP_INFO, for example
   Linux kernels before 2.4, the sample fetch fails.
 
-fc_reordering(<unit>) : integer
+fc_reordering : integer
   Returns the reordering counter measured by the kernel for the client
   connection. If the server connection is not established, if the connection is
   not TCP or if the operating system does not support TCP_INFO, for example
@@ -14732,7 +14861,13 @@ src : ip
   behind a proxy. However if the "accept-proxy" or "accept-netscaler-cip" bind
   directive is used, it can be the address of a client behind another
   PROXY-protocol compatible component for all rule sets except
-  "tcp-request connection" which sees the real address.
+  "tcp-request connection" which sees the real address. When the incoming
+  connection passed through address translation or redirection involving
+  connection tracking, the original destination address before the redirection
+  will be reported. On Linux systems, the source and destination may seldom
+  appear reversed if the nf_conntrack_tcp_loose sysctl is set, because a late
+  response may reopen a timed out connection and switch what is believed to be
+  the source and the destination.
 
   Example:
        # add an HTTP header in requests with the originating address' country
@@ -14985,7 +15120,7 @@ ssl_bc_alg_keysize : integer
 ssl_bc_alpn : string
   This extracts the Application Layer Protocol Negotiation field from an
   outgoing connection made via a TLS transport layer.
-  The result is a string containing the protocol name negociated with the
+  The result is a string containing the protocol name negotiated with the
   server. The SSL library must have been built with support for TLS
   extensions enabled (check haproxy -vv). Note that the TLS ALPN extension is
   not advertised unless the "alpn" keyword on the "server" line specifies a
@@ -15005,7 +15140,7 @@ ssl_bc_is_resumed : boolean
 ssl_bc_npn : string
   This extracts the Next Protocol Negotiation field from an outgoing connection
   made via a TLS transport layer. The result is a string containing the
-  protocol name negociated with the server . The SSL library must have been
+  protocol name negotiated with the server . The SSL library must have been
   built with support for TLS extensions enabled (check haproxy -vv). Note that
   the TLS NPN extension is not advertised unless the "npn" keyword on the
   "server" line specifies a protocol list. Also, nothing forces the server to
@@ -15459,6 +15594,22 @@ rdp_cookie_cnt([name]) : integer (deprecated)
 
   ACL derivatives :
     req_rdp_cookie_cnt([<name>]) : integer match
+
+req.ssl_alpn : string
+  Returns a string containing the values of the Application-Layer Protocol
+  Negotiation (ALPN) TLS extension (RFC7301), sent by the client within the SSL
+  ClientHello message. Note that this only applies to raw contents found in the
+  request buffer and not to the contents deciphered via an SSL data layer, so
+  this will not work with "bind" lines having the "ssl" option. This is useful
+  in ACL to make a routing decision based upon the ALPN preferences of a TLS
+  client, like in the example below. See also "ssl_fc_alpn".
+
+  Examples :
+     # Wait for a client hello for at most 5 seconds
+     tcp-request inspect-delay 5s
+     tcp-request content accept if { req_ssl_hello_type 1 }
+     use_backend bk_acme if { req.ssl_alpn acme-tls/1 }
+     default_backend bk_default
 
 req.ssl_ec_ext : boolean
   Returns a boolean identifying if client sent the Supported Elliptic Curves
@@ -17863,13 +18014,13 @@ max-age <seconds>
 10.2.2. Proxy section
 ---------------------
 
-http-request cache-use <name>
+http-request cache-use <name> [ { if | unless } <condition> ]
   Try to deliver a cached object from the cache <name>. This directive is also
   mandatory to store the cache as it calculates the cache hash. If you want to
   use a condition for both storage and delivering that's a good idea to put it
   after this one.
 
-http-response cache-store <name>
+http-response cache-store <name> [ { if | unless } <condition> ]
   Store an http-response within the cache. The storage of the response headers
   is done at this step, which means you can use others http-response actions
   to modify headers before or after the storage of the response. This action

@@ -173,8 +173,11 @@ static inline void si_release_endpoint(struct stream_interface *si)
 		if (appctx->applet->release && si->state < SI_ST_DIS)
 			appctx->applet->release(appctx);
 		appctx_free(appctx); /* we share the connection pool */
-	} else if ((conn = objt_conn(si->end)))
+	} else if ((conn = objt_conn(si->end))) {
+		conn_stop_tracking(conn);
+		conn_full_close(conn);
 		conn_free(conn);
+	}
 	si_detach_endpoint(si);
 }
 
@@ -417,6 +420,12 @@ static inline void si_shutw(struct stream_interface *si)
 	si->ops->shutw(si);
 }
 
+/* Marks on the stream-interface that next shutw must kill the whole connection */
+static inline void si_must_kill_conn(struct stream_interface *si)
+{
+	si->flags |= SI_FL_KILL_CONN;
+}
+
 /* This is to be used after making some room available in a channel. It will
  * return without doing anything if the stream interface's RX path is blocked.
  * It will automatically mark the stream interface as busy processing the end
@@ -488,10 +497,10 @@ static inline int si_connect(struct stream_interface *si, struct connection *con
 		si->state = SI_ST_CON;
 	}
 	else {
-		/* reuse the existing connection */
-
-		/* the connection is established */
-		si->state = SI_ST_EST;
+		/* try to reuse the existing connection, it will be
+		 * confirmed once we can send on it.
+		 */
+		si->state = SI_ST_CON;
 	}
 
 	/* needs src ip/port for logging */

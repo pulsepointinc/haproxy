@@ -187,6 +187,7 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 	struct sockaddr_un addr;
 	const char *msg = NULL;
 	const char *path;
+	int maxpathlen;
 	int ext, ready;
 	socklen_t ready_len;
 	int err;
@@ -205,6 +206,8 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 		listener->fd = uxst_find_compatible_fd(listener);
 	path = ((struct sockaddr_un *)&listener->addr)->sun_path;
 
+	maxpathlen = MIN(MAXPATHLEN, sizeof(addr.sun_path));
+
 	/* if the listener already has an fd assigned, then we were offered the
 	 * fd by an external process (most likely the parent), and we don't want
 	 * to create a new socket. However we still want to set a few flags on
@@ -216,17 +219,17 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 		goto fd_ready;
 
 	if (path[0]) {
-		ret = snprintf(tempname, MAXPATHLEN, "%s.%d.tmp", path, pid);
-		if (ret < 0 || ret >= MAXPATHLEN) {
+		ret = snprintf(tempname, maxpathlen, "%s.%d.tmp", path, pid);
+		if (ret < 0 || ret >= maxpathlen) {
 			err |= ERR_FATAL | ERR_ALERT;
-			msg = "name too long for UNIX socket";
+			msg = "name too long for UNIX socket (limit usually 97)";
 			goto err_return;
 		}
 
-		ret = snprintf(backname, MAXPATHLEN, "%s.%d.bak", path, pid);
-		if (ret < 0 || ret >= MAXPATHLEN) {
+		ret = snprintf(backname, maxpathlen, "%s.%d.bak", path, pid);
+		if (ret < 0 || ret >= maxpathlen) {
 			err |= ERR_FATAL | ERR_ALERT;
-			msg = "name too long for UNIX socket";
+			msg = "name too long for UNIX socket (limit usually 97)";
 			goto err_return;
 		}
 
@@ -250,7 +253,7 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 			goto err_return;
 		}
 
-		strncpy(addr.sun_path, tempname, sizeof(addr.sun_path));
+		strncpy(addr.sun_path, tempname, sizeof(addr.sun_path) - 1);
 		addr.sun_path[sizeof(addr.sun_path) - 1] = 0;
 	}
 	else {
@@ -340,8 +343,8 @@ static int uxst_bind_listener(struct listener *listener, char *errmsg, int errle
 	listener->state = LI_LISTEN;
 
 	fd_insert(fd, listener, listener->proto->accept,
-		  listener->bind_conf->bind_thread[relative_pid-1] ?
-		  listener->bind_conf->bind_thread[relative_pid-1] : MAX_THREADS_MASK);
+		  (listener->bind_conf->bind_thread[relative_pid-1] ?
+		   listener->bind_conf->bind_thread[relative_pid-1] : MAX_THREADS_MASK) & all_threads_mask);
 
 	return err;
 
@@ -380,6 +383,9 @@ static int uxst_unbind_listener(struct listener *listener)
 /* Add <listener> to the list of unix stream listeners (port is ignored). The
  * listener's state is automatically updated from LI_INIT to LI_ASSIGNED.
  * The number of listeners for the protocol is updated.
+ *
+ * Must be called with proto_lock held.
+ *
  */
 static void uxst_add_listener(struct listener *listener, int port)
 {
@@ -607,6 +613,8 @@ static int uxst_connect_server(struct connection *conn, int data, int delack)
  * loose them across the fork(). A call to uxst_enable_listeners() is needed
  * to complete initialization.
  *
+ * Must be called with proto_lock held.
+ *
  * The return value is composed from ERR_NONE, ERR_RETRYABLE and ERR_FATAL.
  */
 static int uxst_bind_listeners(struct protocol *proto, char *errmsg, int errlen)
@@ -626,6 +634,9 @@ static int uxst_bind_listeners(struct protocol *proto, char *errmsg, int errlen)
 /* This function stops all listening UNIX sockets bound to the protocol
  * <proto>. It does not detaches them from the protocol.
  * It always returns ERR_NONE.
+ *
+ * Must be called with proto_lock held.
+ *
  */
 static int uxst_unbind_listeners(struct protocol *proto)
 {

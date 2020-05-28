@@ -54,7 +54,9 @@ const char *ssl_sock_get_sni(struct connection *conn);
 const char *ssl_sock_get_cert_sig(struct connection *conn);
 const char *ssl_sock_get_cipher_name(struct connection *conn);
 const char *ssl_sock_get_proto_version(struct connection *conn);
+void ssl_sock_set_alpn(struct connection *conn, const unsigned char *, int);
 void ssl_sock_set_servername(struct connection *conn, const char *hostname);
+
 int ssl_sock_get_cert_used_sess(struct connection *conn);
 int ssl_sock_get_cert_used_conn(struct connection *conn);
 int ssl_sock_get_remote_common_name(struct connection *conn,
@@ -65,7 +67,7 @@ unsigned int ssl_sock_get_verify_result(struct connection *conn);
 int ssl_sock_update_ocsp_response(struct buffer *ocsp_response, char **err);
 #endif
 #if (defined SSL_CTRL_SET_TLSEXT_TICKET_KEY_CB && TLS_TICKETS_NO > 0)
-void ssl_sock_update_tlskey_ref(struct tls_keys_ref *ref,
+int ssl_sock_update_tlskey_ref(struct tls_keys_ref *ref,
 				struct buffer *tlskey);
 int ssl_sock_update_tlskey(char *filename, struct buffer *tlskey, char **err);
 struct tls_keys_ref *tlskeys_ref_lookup(const char *filename);
@@ -83,6 +85,10 @@ SSL_CTX *ssl_sock_get_generated_cert(unsigned int key, struct bind_conf *bind_co
 int ssl_sock_set_generated_cert(SSL_CTX *ctx, unsigned int key, struct bind_conf *bind_conf);
 unsigned int ssl_sock_generated_cert_key(const void *data, size_t len);
 
+#if (OPENSSL_VERSION_NUMBER >= 0x1010000fL) && !defined(OPENSSL_NO_ASYNC)
+void ssl_async_fd_handler(int fd);
+void ssl_async_fd_free(int fd);
+#endif
 
 /* ssl shctx macro */
 

@@ -1,6 +1,6 @@
 Summary: HA-Proxy is a TCP/HTTP reverse proxy for high availability environments
 Name: haproxy
-Version: 1.9.0
+Version: 1.9.15
 Release: 1
 License: GPL
 Group: System Environment/Daemons
@@ -74,6 +74,51 @@ fi
 %attr(0755,root,root) %config %{_sysconfdir}/rc.d/init.d/%{name}
 
 %changelog
+* Thu Apr  2 2020 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.15
+
+* Thu Feb 13 2020 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.14
+
+* Mon Nov 25 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.13
+
+* Thu Oct 24 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.12
+
+* ven. sept. 27 2019 Christopher Faulet <cfaulet@haproxy.com>
+- updated to 1.9.11
+
+* Thu Aug  8 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.10
+
+* Tue Jul 23 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.9
+
+* Mon May 13 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.8
+
+* Thu Apr 25 2019 Christopher Faulet <cfaulet@haproxy.com>
+- updated to 1.9.7
+
+* Fri Mar 29 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.6
+
+* Tue Mar 19 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.5
+
+* Wed Feb  6 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.4
+
+* Tue Jan 29 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.3
+
+* Wed Jan 16 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.2
+
+* Tue Jan  8 2019 Willy Tarreau <w@1wt.eu>
+- updated to 1.9.1
+
 * Wed Dec 19 2018 Willy Tarreau <w@1wt.eu>
 - updated to 1.9.0
 

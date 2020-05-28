@@ -28,7 +28,7 @@
 #ifndef _COMMON_BUF_H
 #define _COMMON_BUF_H
 
-#include <stdint.h>
+#include <inttypes.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -42,8 +42,8 @@ struct buffer {
 
 /* A buffer may be in 3 different states :
  *   - unallocated : size == 0, area == 0  (b_is_null() is true)
- *   - waiting     : size == 0, area != 0
- *   - allocated   : size  > 0, area  > 0
+ *   - waiting     : size == 0, area != 0  (b_is_null() is true)
+ *   - allocated   : size  > 0, area  > 0  (b_is_null() is false)
  */
 
 /* initializers for certain buffer states. It is important that the NULL buffer
@@ -62,11 +62,12 @@ struct buffer {
 /***************************************************************************/
 
 /* b_is_null() : returns true if (and only if) the buffer is not yet allocated
- * and thus points to a NULL area.
+ * and thus has an empty size. Its pointer may then be anything, including NULL
+ * (unallocated) or an invalid pointer such as (char*)1 (allocation pending).
  */
 static inline int b_is_null(const struct buffer *buf)
 {
-	return buf->area == NULL;
+	return buf->size == 0;
 }
 
 /* b_orig() : returns the pointer to the origin of the storage, which is the
@@ -562,6 +563,63 @@ static inline size_t b_xfer(struct buffer *dst, struct buffer *src, size_t count
 	b_del(src, ret);
  leave:
 	return ret;
+}
+
+/* Moves <len> bytes from absolute position <src> of buffer <b> by <shift>
+ * bytes, while supporting wrapping of both the source and the destination.
+ * The position is relative to the buffer's origin and may overlap with the
+ * target position. The <shift>'s absolute value must be strictly lower than
+ * the buffer's size. The main purpose is to aggregate data block during
+ * parsing while removing unused delimiters. The buffer's length is not
+ * modified, and the caller must take care of size adjustments and holes by
+ * itself.
+ */
+static inline void b_move(const struct buffer *b, size_t src, size_t len, ssize_t shift)
+{
+	char  *orig = b_orig(b);
+	size_t size = b_size(b);
+	size_t dst  = src + size + shift;
+	size_t cnt;
+
+	if (dst >= size)
+		dst -= size;
+
+	if (shift < 0) {
+		/* copy from left to right */
+		for (; (cnt = len); len -= cnt) {
+			if (cnt > size - src)
+				cnt = size - src;
+			if (cnt > size - dst)
+				cnt = size - dst;
+
+			memmove(orig + dst, orig + src, cnt);
+			dst += cnt;
+			src += cnt;
+			if (dst >= size)
+				dst -= size;
+			if (src >= size)
+				src -= size;
+		}
+	}
+	else if (shift > 0) {
+		/* copy from right to left */
+		for (; (cnt = len); len -= cnt) {
+			size_t src_end = src + len;
+			size_t dst_end = dst + len;
+
+			if (dst_end > size)
+				dst_end -= size;
+			if (src_end > size)
+				src_end -= size;
+
+			if (cnt > dst_end)
+				cnt = dst_end;
+			if (cnt > src_end)
+				cnt = src_end;
+
+			memmove(orig + dst_end - cnt, orig + src_end - cnt, cnt);
+		}
+	}
 }
 
 /* b_rep_blk() : writes the block <blk> at position <pos> which must be in

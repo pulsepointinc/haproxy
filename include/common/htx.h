@@ -170,6 +170,8 @@ extern struct htx htx_empty;
 struct htx_blk *htx_defrag(struct htx *htx, struct htx_blk *blk);
 struct htx_blk *htx_add_blk(struct htx *htx, enum htx_blk_type type, uint32_t blksz);
 struct htx_blk *htx_remove_blk(struct htx *htx, struct htx_blk *blk);
+void htx_truncate(struct htx *htx, uint32_t offset);
+struct htx_ret htx_drain(struct htx *htx, uint32_t max);
 
 struct htx_blk *htx_replace_blk_value(struct htx *htx, struct htx_blk *blk,
 				      const struct ist old, const struct ist new);
@@ -185,13 +187,14 @@ struct htx_blk *htx_replace_header(struct htx *htx, struct htx_blk *blk,
 				   const struct ist name, const struct ist value);
 
 struct htx_blk *htx_add_header(struct htx *htx, const struct ist name, const struct ist value);
+struct htx_blk *htx_add_blk_type_size(struct htx *htx, enum htx_blk_type type, uint32_t blksz);
 struct htx_blk *htx_add_all_headers(struct htx *htx, const struct http_hdr *hdrs);
 struct htx_blk *htx_add_pseudo_header(struct htx *htx,  enum htx_phdr_type phdr, const struct ist value);
 struct htx_blk *htx_add_endof(struct htx *htx, enum htx_blk_type type);
 struct htx_blk *htx_add_data(struct htx *htx, const struct ist data);
 struct htx_blk *htx_add_trailer(struct htx *htx, const struct ist tlr);
 struct htx_blk *htx_add_oob(struct htx *htx, const struct ist oob);
-struct htx_blk *htx_add_data_before(struct htx *htx, const struct htx_blk *ref, const struct ist data);
+struct htx_blk *htx_add_last_data(struct htx *htx, struct ist data);
 
 int htx_reqline_to_h1(const struct htx_sl *sl, struct buffer *chk);
 int htx_stline_to_h1(const struct htx_sl *sl, struct buffer *chk);
@@ -276,7 +279,7 @@ static inline struct htx_sl *htx_get_stline(struct htx *htx)
 {
 	struct htx_sl *sl = NULL;
 
-	if (htx->sl_off != -1)
+	if (htx->used && htx->sl_off != -1)
 		sl = ((void *)htx->blocks + htx->sl_off);
 
 	return sl;
@@ -632,6 +635,15 @@ static inline uint32_t htx_free_space(const struct htx *htx)
 	return (htx->size - htx_used_space(htx));
 }
 
+/* Returns the maximum space usable for data in <htx>. This is in fact the
+ * maximum sice for a uniq block to fill the HTX message. */
+static inline uint32_t htx_max_data_space(const struct htx *htx)
+{
+	if (!htx->size)
+		return 0;
+	return (htx->size - sizeof(htx->blocks[0]));
+}
+
 /* Returns the maximum size available to store some data in <htx> if a new block
  * is reserved.
  */
@@ -679,7 +691,10 @@ static inline size_t buf_room_for_htx_data(const struct buffer *buf)
 
 
 /* Returns an HTX message using the buffer <buf>. Unlike htx_from_buf(), this
- * function does not update to the buffer. */
+ * function does not update to the buffer.
+ * Note that it always returns a valid pointer, either to an initialized buffer
+ * or to the empty buffer.
+ */
 static inline struct htx *htxbuf(const struct buffer *buf)
 {
 	struct htx *htx;
@@ -696,10 +711,10 @@ static inline struct htx *htxbuf(const struct buffer *buf)
 
 /* Returns an HTX message using the buffer <buf>. <buf> is updated to appear as
  * full. It is the caller responsibility to call htx_to_buf() when it finish to
- * manipulate the HTX message to update <buf> accordingly.
+ * manipulate the HTX message to update <buf> accordingly. The returned pointer
+ * is always valid.
  *
- * If the caller can call htxbuf() function to avoir any update of the
- * buffer.
+ * The caller can call htxbuf() function to avoid any update of the buffer.
  */
 static inline struct htx *htx_from_buf(struct buffer *buf)
 {
@@ -712,7 +727,7 @@ static inline struct htx *htx_from_buf(struct buffer *buf)
 /* Upate <buf> accordingly to the HTX message <htx> */
 static inline void htx_to_buf(struct htx *htx, struct buffer *buf)
 {
-	if (!htx->used) {
+	if (!htx->used && !(htx->flags & HTX_FL_PARSING_ERROR)) {
 		htx_reset(htx);
 		b_set_data(buf, 0);
 	}
@@ -720,16 +735,20 @@ static inline void htx_to_buf(struct htx *htx, struct buffer *buf)
 		b_set_data(buf, b_size(buf));
 }
 
-/* Returns 1 if the message is empty, otherwise it returns 0. */
+/* Returns 1 if the message is empty, otherwise it returns 0. Note that it is
+ * illegal to call this with htx == NULL.
+ */
 static inline int htx_is_empty(const struct htx *htx)
 {
-	return (!htx || !htx->used);
+	return !htx->used;
 }
 
-/* Returns 1 if the message is not empty, otherwise it returns 0. */
+/* Returns 1 if the message is not empty, otherwise it returns 0. Note that it
+ * is illegal to call this with htx == NULL.
+ */
 static inline int htx_is_not_empty(const struct htx *htx)
 {
-	return (htx && htx->used);
+	return htx->used;
 }
 
 /* For debugging purpose */

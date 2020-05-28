@@ -33,6 +33,9 @@
 #define TASK_SLEEPING     0x0000  /* task sleeping */
 #define TASK_RUNNING      0x0001  /* the task is currently running */
 #define TASK_GLOBAL       0x0002  /* The task is currently in the global runqueue */
+#define TASK_QUEUED       0x0004  /* The task has been (re-)added to the run queue */
+#define TASK_SHARED_WQ    0x0008  /* The task's expiration may be updated by other
+                                   * threads, must be set before first queue/wakeup */
 
 #define TASK_WOKEN_INIT   0x0100  /* woken up for initialisation purposes */
 #define TASK_WOKEN_TIMER  0x0200  /* woken up because of expired timer */
@@ -94,6 +97,23 @@ struct tasklet {
  * which case it returns NULL so that the scheduler knows it must not check the
  * expire timer. The scheduler will requeue the task at the proper location.
  */
+
+
+/* A work_list is a thread-safe way to enqueue some work to be run on another
+ * thread. It consists of a list, a task and a general-purpose argument.
+ * A work is appended to the list by atomically adding a list element to the
+ * list and waking up the associated task, which is done using work_add(). The
+ * caller must be careful about how operations are run as it will definitely
+ * happen that the element being enqueued is processed by the other thread
+ * before the call returns. Some locking conventions between the caller and the
+ * callee might sometimes be necessary. The task is always woken up with reason
+ * TASK_WOKEN_OTHER and a context pointing to the work_list entry.
+ */
+struct work_list {
+	struct list head;
+	struct task *task;
+	void *arg;
+};
 
 #endif /* _TYPES_TASK_H */
 

@@ -22,7 +22,7 @@
 #ifndef _PROTO_CHANNEL_H
 #define _PROTO_CHANNEL_H
 
-#include <stdint.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +38,7 @@
 #include <types/stream.h>
 #include <types/stream_interface.h>
 
+#include <proto/stream.h>
 #include <proto/task.h>
 
 /* perform minimal intializations, report 0 in case of error, 1 if OK. */
@@ -361,24 +362,43 @@ static inline void channel_forward_forever(struct channel *chn)
 	chn->to_forward = CHN_INFINITE_FORWARD;
 }
 
+/* <len> bytes of input data was added into the channel <chn>. This functions
+ * must be called to update the channel state. It also handles the fast
+ * forwarding. */
+static inline void channel_add_input(struct channel *chn, unsigned int len)
+{
+	if (chn->to_forward) {
+		unsigned long fwd = len;
+		if (chn->to_forward != CHN_INFINITE_FORWARD) {
+			if (fwd > chn->to_forward)
+				fwd = chn->to_forward;
+			chn->to_forward -= fwd;
+		}
+		c_adv(chn, fwd);
+	}
+	/* notify that some data was read */
+	chn->total += len;
+	chn->flags |= CF_READ_PARTIAL;
+}
+
 static inline unsigned long long channel_htx_forward(struct channel *chn, struct htx *htx, unsigned long long bytes)
 {
-	unsigned long long ret;
+	unsigned long long ret = 0;
 
-	b_set_data(&chn->buf, htx->data);
-	ret = channel_forward(chn, bytes);
-	b_set_data(&chn->buf, b_size(&chn->buf));
+	if (htx->data) {
+		b_set_data(&chn->buf, htx->data);
+		ret = channel_forward(chn, bytes);
+		b_set_data(&chn->buf, b_size(&chn->buf));
+	}
 	return ret;
 }
 
 
 static inline void channel_htx_forward_forever(struct channel *chn, struct htx *htx)
 {
-	b_set_data(&chn->buf, htx->data);
-	channel_forward_forever(chn);
-	b_set_data(&chn->buf, b_size(&chn->buf));
+	c_adv(chn, htx->data - co_data(chn));
+	chn->to_forward = CHN_INFINITE_FORWARD;
 }
-
 /*********************************************************************/
 /* These functions are used to compute various channel content sizes */
 /*********************************************************************/
@@ -455,6 +475,39 @@ static inline int channel_may_recv(const struct channel *chn)
 	return rem < 0 || (unsigned int)rem < chn->to_forward;
 }
 
+/* HTX version of channel_may_recv(). Returns non-zero if the channel can still
+ * receive data. */
+static inline int channel_htx_may_recv(const struct channel *chn, const struct htx *htx)
+{
+	uint32_t rem;
+
+	if (!htx->size)
+		return 1;
+
+	if (!channel_may_send(chn))
+		return 0; /* don't touch reserve until we can send */
+
+	rem = htx_free_data_space(htx);
+	if (!rem)
+		return 0; /* htx already full */
+
+	if (rem > global.tune.maxrewrite)
+		return 1; /* reserve not yet reached */
+
+	/* Now we know there's some room left in the reserve and we may
+	 * forward. As long as i-to_fwd < size-maxrw, we may still
+	 * receive. This is equivalent to i+maxrw-size < to_fwd,
+	 * which is logical since i+maxrw-size is what overlaps with
+	 * the reserve, and we want to ensure they're covered by scheduled
+	 * forwards.
+	 */
+	rem += co_data(chn);
+	if (rem > global.tune.maxrewrite)
+		return 1;
+
+	return (global.tune.maxrewrite - rem < chn->to_forward);
+}
+
 /* Returns true if the channel's input is already closed */
 static inline int channel_input_closed(struct channel *chn)
 {
@@ -494,7 +547,14 @@ static inline void channel_check_timeouts(struct channel *chn)
 static inline void channel_erase(struct channel *chn)
 {
 	chn->to_forward = 0;
+	chn->output = 0;
 	b_reset(&chn->buf);
+}
+
+static inline void channel_htx_erase(struct channel *chn, struct htx *htx)
+{
+	htx_reset(htx);
+	channel_erase(chn);
 }
 
 /* marks the channel as "shutdown" ASAP for reads */
@@ -653,6 +713,55 @@ static inline int channel_recv_limit(const struct channel *chn)
 	return chn->buf.size - reserve;
 }
 
+/* HTX version of channel_recv_limit(). Return the max number of bytes the HTX
+ * buffer can contain so that once all the pending bytes are forwarded, the
+ * buffer still has global.tune.maxrewrite bytes free.
+ */
+static inline int channel_htx_recv_limit(const struct channel *chn, const struct htx *htx)
+{
+	unsigned int transit;
+	int reserve;
+
+	/* return zeor if not allocated */
+	if (!htx->size)
+		return 0;
+
+	/* return max_data_space - maxrewrite if we can't send */
+	reserve = global.tune.maxrewrite;
+	if (unlikely(!channel_may_send(chn)))
+		goto end;
+
+	/* We need to check what remains of the reserve after o and to_forward
+	 * have been transmitted, but they can overflow together and they can
+	 * cause an integer underflow in the comparison since both are unsigned
+	 * while maxrewrite is signed.
+	 * The code below has been verified for being a valid check for this :
+	 *   - if (o + to_forward) overflow => return max_data_space  [ large enough ]
+	 *   - if o + to_forward >= maxrw   => return max_data_space  [ large enough ]
+	 *   - otherwise return max_data_space - (maxrw - (o + to_forward))
+	 */
+	transit = co_data(chn) + chn->to_forward;
+	reserve -= transit;
+	if (transit < chn->to_forward ||                 // addition overflow
+	    transit >= (unsigned)global.tune.maxrewrite) // enough transit data
+		return htx_max_data_space(htx);
+ end:
+	return (htx_max_data_space(htx) - reserve);
+}
+
+/* HTX version of channel_full(). Instead of checking if INPUT data exceeds
+ * (size - reserve), this function checks if the free space for data in <htx>
+ * and the data scheduled for output are lower to the reserve. In such case, the
+ * channel is considered as full.
+ */
+static inline int channel_htx_full(const struct channel *c, const struct htx *htx,
+				   unsigned int reserve)
+{
+	if (!htx->size)
+		return 0;
+	return (htx_free_data_space(htx) + co_data(c) <= reserve);
+}
+
 /* Returns non-zero if the channel's INPUT buffer's is considered full, which
  * means that it holds at least as much INPUT data as (size - reserve). This
  * also means that data that are scheduled for output are considered as potential
@@ -666,6 +775,9 @@ static inline int channel_full(const struct channel *c, unsigned int reserve)
 {
 	if (b_is_null(&c->buf))
 		return 0;
+
+	if (strm_fe((chn_strm(c)))->options2 & PR_O2_USE_HTX)
+		return channel_htx_full(c, htxbuf(&c->buf), reserve);
 
 	return (ci_data(c) + reserve >= c_size(c));
 }
@@ -681,6 +793,17 @@ static inline int channel_recv_max(const struct channel *chn)
 	int ret;
 
 	ret = channel_recv_limit(chn) - b_data(&chn->buf);
+	if (ret < 0)
+		ret = 0;
+	return ret;
+}
+
+/* HTX version of channel_recv_max(). */
+static inline int channel_htx_recv_max(const struct channel *chn, const struct htx *htx)
+{
+	int ret;
+
+	ret = channel_htx_recv_limit(chn, htx) - htx->data;
 	if (ret < 0)
 		ret = 0;
 	return ret;
@@ -766,6 +889,17 @@ static inline void channel_truncate(struct channel *chn)
 	chn->buf.data = co_data(chn);
 }
 
+static inline void channel_htx_truncate(struct channel *chn, struct htx *htx)
+{
+	if (!co_data(chn))
+		return channel_htx_erase(chn, htx);
+
+	chn->to_forward = 0;
+	if (htx->data == co_data(chn))
+		return;
+	htx_truncate(htx, co_data(chn));
+}
+
 /* This function realigns a possibly wrapping channel buffer so that the input
  * part is contiguous and starts at the beginning of the buffer and the output
  * part ends at the end of the buffer. This provides the best conditions since
@@ -782,7 +916,7 @@ static inline void channel_slow_realign(struct channel *chn, char *swap)
  * when data have been read directly from the buffer. It is illegal to call
  * this function with <len> causing a wrapping at the end of the buffer. It's
  * the caller's responsibility to ensure that <len> is never larger than
- * chn->o. Channel flag WRITE_PARTIAL is set.
+ * chn->o. Channel flags WRITE_PARTIAL and WROTE_DATA are set.
  */
 static inline void co_skip(struct channel *chn, int len)
 {
@@ -791,7 +925,27 @@ static inline void co_skip(struct channel *chn, int len)
 	c_realign_if_empty(chn);
 
 	/* notify that some data was written to the SI from the buffer */
-	chn->flags |= CF_WRITE_PARTIAL;
+	chn->flags |= CF_WRITE_PARTIAL | CF_WROTE_DATA;
+	chn_prod(chn)->flags &= ~SI_FL_RXBLK_ROOM; // si_rx_room_rdy()
+}
+
+/* HTX version of co_skip(). This function skips at most <len> bytes from the
+ * output of the channel <chn>. Depending on how data are stored in <htx> less
+ * than <len> bytes can be skipped. Channel flags WRITE_PARTIAL and WROTE_DATA
+ * are set.
+ */
+static inline void co_htx_skip(struct channel *chn, struct htx *htx, int len)
+{
+	struct htx_ret htxret;
+
+	htxret = htx_drain(htx, len);
+	if (htxret.ret) {
+		chn->output -= htxret.ret;
+
+		/* notify that some data was written to the SI from the buffer */
+		chn->flags |= CF_WRITE_PARTIAL | CF_WROTE_DATA;
+		chn_prod(chn)->flags &= ~SI_FL_RXBLK_ROOM; // si_rx_room_rdy()
+	}
 }
 
 /* Tries to copy chunk <chunk> into the channel's buffer after length controls.

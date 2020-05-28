@@ -332,11 +332,11 @@ flt_check(struct proxy *proxy)
 	struct flt_conf *fconf;
 	int err = 0;
 
+	err += check_implicit_http_comp_flt(proxy);
 	list_for_each_entry(fconf, &proxy->filter_configs, list) {
 		if (fconf->ops->check)
 			err += fconf->ops->check(proxy, fconf);
 	}
-	err += check_implicit_http_comp_flt(proxy);
 	return err;
 }
 
@@ -783,8 +783,9 @@ flt_http_payload(struct stream *s, struct http_msg *msg, unsigned int len)
 	struct filter *filter;
 	unsigned long long *strm_off = &FLT_STRM_OFF(s, msg->chn);
 	unsigned int out = co_data(msg->chn);
-	int ret = len - out;
+	int ret, data;
 
+	ret = data = len - out;
 	list_for_each_entry(filter, &strm_flt(s)->filters, list) {
 		/* Call "data" filters only */
 		if (!IS_DATA_FILTER(filter, msg->chn))
@@ -793,15 +794,19 @@ flt_http_payload(struct stream *s, struct http_msg *msg, unsigned int len)
 			unsigned long long *flt_off = &FLT_OFF(filter, msg->chn);
 			unsigned int offset = *flt_off - *strm_off;
 
-			ret = FLT_OPS(filter)->http_payload(s, filter, msg, out + offset, ret - offset);
+			ret = FLT_OPS(filter)->http_payload(s, filter, msg, out + offset, data - offset);
 			if (ret < 0)
 				goto end;
+			data = ret + *flt_off - *strm_off;
 			*flt_off += ret;
-			ret += offset;
 		}
 	}
-	*strm_off += ret;
 
+	/* Only forward data if the last filter decides to forward something */
+	if (ret > 0) {
+		ret = data;
+		*strm_off += ret;
+	}
  end:
 	return ret;
 }
@@ -930,14 +935,14 @@ flt_analyze_http_headers(struct stream *s, struct channel *chn, unsigned int an_
 	} RESUME_FILTER_END;
 
 	if (IS_HTX_STRM(s)) {
-		struct htx *htx = htxbuf(&chn->buf);
-		int32_t pos;
+		if (HAS_DATA_FILTERS(s, chn)) {
+			size_t data = http_get_hdrs_size(htxbuf(&chn->buf));
+			struct filter *f;
 
-		for (pos = htx_get_head(htx); pos != -1; pos = htx_get_next(htx, pos)) {
-			struct htx_blk *blk = htx_get_blk(htx, pos);
-			c_adv(chn, htx_get_blksz(blk));
-			if (htx_get_blk_type(blk) == HTX_BLK_EOH)
-				break;
+			list_for_each_entry(f, &strm_flt(s)->filters, list) {
+				if (IS_DATA_FILTER(f, chn))
+					FLT_OFF(f, chn) = data;
+			}
 		}
 	}
 	else {
@@ -1153,7 +1158,7 @@ flt_xfer_data(struct stream *s, struct channel *chn, unsigned int an_bit)
 	int ret = 1;
 
 	/* If there is no "data" filters, we do nothing */
-	if (!HAS_DATA_FILTERS(s, chn))
+	if (!HAS_DATA_FILTERS(s, chn) || IS_HTX_STRM(s))
 		goto end;
 
 	/* Be sure that the output is still opened. Else we stop the data
@@ -1200,6 +1205,7 @@ handle_analyzer_result(struct stream *s, struct channel *chn,
 		       unsigned int an_bit, int ret)
 {
 	int finst;
+	int status = 0;
 
 	if (ret < 0)
 		goto return_bad_req;
@@ -1221,21 +1227,23 @@ handle_analyzer_result(struct stream *s, struct channel *chn,
 	if (!(chn->flags & CF_ISRESP)) {
 		s->req.analysers &= AN_REQ_FLT_END;
 		finst = SF_FINST_R;
+		status = 400;
 		/* FIXME: incr counters */
 	}
 	else {
 		s->res.analysers &= AN_RES_FLT_END;
 		finst = SF_FINST_H;
+		status = 502;
 		/* FIXME: incr counters */
 	}
 
 	if (s->txn) {
 		/* Do not do that when we are waiting for the next request */
-		if (s->txn->status)
+		if (s->txn->status > 0)
 			http_reply_and_close(s, s->txn->status, NULL);
 		else {
-			s->txn->status = 400;
-			http_reply_and_close(s, 400, http_error_message(s));
+			s->txn->status = status;
+			http_reply_and_close(s, status, http_error_message(s));
 		}
 	}
 

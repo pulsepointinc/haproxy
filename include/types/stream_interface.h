@@ -64,7 +64,7 @@ enum {
 	SI_FL_NONE       = 0x00000000,  /* nothing */
 	SI_FL_EXP        = 0x00000001,  /* timeout has expired */
 	SI_FL_ERR        = 0x00000002,  /* a non-recoverable error has occurred */
-	/* unused:         0x00000004 */
+	SI_FL_KILL_CONN  = 0x00000004,  /* next shutw must kill the whole conn, not just the stream */
 	SI_FL_WAIT_DATA  = 0x00000008,  /* stream-int waits for more outgoing data to send */
 	SI_FL_ISBACK     = 0x00000010,  /* 0 for front-side SI, 1 for back-side */
 	SI_FL_DONT_WAKE  = 0x00000020,  /* resync in progress, don't wake up */
@@ -72,7 +72,7 @@ enum {
 	SI_FL_NOLINGER   = 0x00000080,  /* may close without lingering. One-shot. */
 	SI_FL_NOHALF     = 0x00000100,  /* no half close, close both sides at once */
 	SI_FL_SRC_ADDR   = 0x00001000,  /* get the source ip/port with getsockname */
-	/* unused:         0x00002000 */
+	/* unused: 0x00000200 */
 	SI_FL_WANT_GET   = 0x00004000,  /* a stream-int would like to get some data from the buffer */
 	SI_FL_CLEAN_ABRT = 0x00008000,  /* SI_FL_ERR is used to report aborts, and not SHUTR */
 

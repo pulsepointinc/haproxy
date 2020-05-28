@@ -48,6 +48,23 @@ static struct task *mux_pt_io_cb(struct task *t, void *tctx, unsigned short stat
 {
 	struct mux_pt_ctx *ctx = tctx;
 
+	if (ctx->cs) {
+		/* There's a small race condition.
+		 * mux_pt_io_cb() is only supposed to be called if we have no
+		 * stream attached. However, maybe the tasklet got woken up,
+		 * and this connection was then attached to a new stream.
+		 * If this happened, just wake the tasklet up if anybody
+		 * subscribed to receive events, and otherwise call the wake
+		 * method, to make sure the event is noticed.
+		 */
+		if (ctx->conn->recv_wait) {
+			ctx->conn->recv_wait->events &= ~SUB_RETRY_RECV;
+			tasklet_wakeup(ctx->conn->recv_wait->task);
+			ctx->conn->recv_wait = NULL;
+		} else if (ctx->cs->data_cb->wake)
+			ctx->cs->data_cb->wake(ctx->cs);
+		return NULL;
+	}
 	conn_sock_drain(ctx->conn);
 	if (ctx->conn->flags & (CO_FL_ERROR | CO_FL_SOCK_RD_SH | CO_FL_SOCK_WR_SH))
 		mux_pt_destroy(ctx);
@@ -193,16 +210,18 @@ static void mux_pt_detach(struct conn_stream *cs)
 		mux_pt_destroy(ctx);
 }
 
-static int mux_pt_avail_streams(struct connection *conn)
+/* returns the number of streams in use on a connection */
+static int mux_pt_used_streams(struct connection *conn)
 {
 	struct mux_pt_ctx *ctx = conn->ctx;
 
-	return (ctx->cs == NULL ? 1 : 0);
+	return ctx->cs ? 1 : 0;
 }
 
-static int mux_pt_max_streams(struct connection *conn)
+/* returns the number of streams still available on a connection */
+static int mux_pt_avail_streams(struct connection *conn)
 {
-	return 1;
+	return 1 - mux_pt_used_streams(conn);
 }
 
 static void mux_pt_shutr(struct conn_stream *cs, enum cs_shr_mode mode)
@@ -252,13 +271,11 @@ static size_t mux_pt_rcv_buf(struct conn_stream *cs, struct buffer *buf, size_t 
 	b_realign_if_empty(buf);
 	ret = cs->conn->xprt->rcv_buf(cs->conn, buf, count, flags);
 	if (conn_xprt_read0_pending(cs->conn)) {
-		if (ret == 0)
-			cs->flags &= ~(CS_FL_RCV_MORE | CS_FL_WANT_ROOM);
+		cs->flags &= ~(CS_FL_RCV_MORE | CS_FL_WANT_ROOM);
 		cs->flags |= CS_FL_EOS;
 	}
 	if (cs->conn->flags & CO_FL_ERROR) {
-		if (ret == 0)
-			cs->flags &= ~(CS_FL_RCV_MORE | CS_FL_WANT_ROOM);
+		cs->flags &= ~(CS_FL_RCV_MORE | CS_FL_WANT_ROOM);
 		cs->flags |= CS_FL_ERROR;
 	}
 	return ret;
@@ -309,6 +326,19 @@ static int mux_pt_snd_pipe(struct conn_stream *cs, struct pipe *pipe)
 }
 #endif
 
+static int mux_pt_ctl(struct connection *conn, enum mux_ctl_type mux_ctl, void *output)
+{
+	int ret = 0;
+	switch (mux_ctl) {
+	case MUX_STATUS:
+		if (conn->flags & CO_FL_CONNECTED)
+			ret |= MUX_STATUS_READY;
+		return ret;
+	default:
+		return -1;
+	}
+}
+
 /* The mux operations */
 const struct mux_ops mux_pt_ops = {
 	.init = mux_pt_init,
@@ -325,8 +355,9 @@ const struct mux_ops mux_pt_ops = {
 	.get_first_cs = mux_pt_get_first_cs,
 	.detach = mux_pt_detach,
 	.avail_streams = mux_pt_avail_streams,
-	.max_streams = mux_pt_max_streams,
+	.used_streams = mux_pt_used_streams,
 	.destroy = mux_pt_destroy_meth,
+	.ctl = mux_pt_ctl,
 	.shutr = mux_pt_shutr,
 	.shutw = mux_pt_shutw,
 	.flags = MX_FL_NONE,

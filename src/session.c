@@ -29,6 +29,8 @@
 #include <proto/vars.h>
 
 DECLARE_POOL(pool_head_session, "session", sizeof(struct session));
+DECLARE_POOL(pool_head_sess_srv_list, "session server list",
+		sizeof(struct sess_srv_list));
 
 static int conn_complete_session(struct connection *conn);
 static struct task *session_expire_embryonic(struct task *t, void *context, unsigned short state);
@@ -41,7 +43,6 @@ static struct task *session_expire_embryonic(struct task *t, void *context, unsi
 struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type *origin)
 {
 	struct session *sess;
-	int i;
 
 	sess = pool_alloc(pool_head_session);
 	if (sess) {
@@ -54,17 +55,11 @@ struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type
 		vars_init(&sess->vars, SCOPE_SESS);
 		sess->task = NULL;
 		sess->t_handshake = -1; /* handshake not done yet */
-		HA_ATOMIC_UPDATE_MAX(&fe->fe_counters.conn_max,
-				     HA_ATOMIC_ADD(&fe->feconn, 1));
-		if (li)
-			proxy_inc_fe_conn_ctr(li, fe);
 		HA_ATOMIC_ADD(&totalconn, 1);
 		HA_ATOMIC_ADD(&jobs, 1);
-		for (i = 0; i < MAX_SRV_LIST; i++) {
-			sess->srv_list[i].target = NULL;
-			LIST_INIT(&sess->srv_list[i].list);
-		}
-		sess->resp_conns = 0;
+		LIST_INIT(&sess->srv_list);
+		sess->idle_conns = 0;
+		sess->flags = SESS_FL_NONE;
 	}
 	return sess;
 }
@@ -72,9 +67,8 @@ struct session *session_new(struct proxy *fe, struct listener *li, enum obj_type
 void session_free(struct session *sess)
 {
 	struct connection *conn, *conn_back;
-	int i;
+	struct sess_srv_list *srv_list, *srv_list_back;
 
-	HA_ATOMIC_SUB(&sess->fe->feconn, 1);
 	if (sess->listener)
 		listener_release(sess->listener);
 	session_store_counters(sess);
@@ -82,26 +76,30 @@ void session_free(struct session *sess)
 	conn = objt_conn(sess->origin);
 	if (conn != NULL && conn->mux)
 		conn->mux->destroy(conn);
-	for (i = 0; i < MAX_SRV_LIST; i++) {
-		int count = 0;
-		list_for_each_entry_safe(conn, conn_back, &sess->srv_list[i].list, session_list) {
-			count++;
+	list_for_each_entry_safe(srv_list, srv_list_back, &sess->srv_list, srv_list) {
+		list_for_each_entry_safe(conn, conn_back, &srv_list->conn_list, session_list) {
 			if (conn->mux) {
 
 				LIST_DEL(&conn->session_list);
 				LIST_INIT(&conn->session_list);
 				conn->owner = NULL;
+				conn->flags &= ~CO_FL_SESS_IDLE;
 				if (!srv_add_to_idle_list(objt_server(conn->target), conn))
 					conn->mux->destroy(conn);
 			} else {
 				/* We have a connection, but not yet an associated mux.
 				 * So destroy it now.
 				 */
+				if (!LIST_ISEMPTY(&conn->session_list)) {
+					LIST_DEL(&conn->session_list);
+					LIST_INIT(&conn->session_list);
+				}
 				conn_stop_tracking(conn);
 				conn_full_close(conn);
 				conn_free(conn);
 			}
 		}
+		pool_free(pool_head_sess_srv_list, srv_list);
 	}
 	pool_free(pool_head_session, sess);
 	HA_ATOMIC_SUB(&jobs, 1);
@@ -293,6 +291,12 @@ int session_accept_fd(struct listener *l, int cfd, struct sockaddr_storage *addr
 	if (conn_complete_session(cli_conn) >= 0)
 		return 1;
 
+	/* if we reach here we have deliberately decided not to keep this
+	 * session (e.g. tcp-request rule), so that's not an error we should
+	 * try to protect against.
+	 */
+	ret = 0;
+
 	/* error unrolling */
  out_free_sess:
 	 /* prevent call to listener_release during session_free. It will be
@@ -305,12 +309,10 @@ int session_accept_fd(struct listener *l, int cfd, struct sockaddr_storage *addr
 	conn_free(cli_conn);
  out_close:
 	listener_release(l);
-	if (ret < 0 && l->bind_conf->xprt == xprt_get(XPRT_RAW) && p->mode == PR_MODE_HTTP) {
+	if (ret < 0 && l->bind_conf->xprt == xprt_get(XPRT_RAW) &&
+	    p->mode == PR_MODE_HTTP && l->bind_conf->mux_proto == NULL) {
 		/* critical error, no more memory, try to emit a 500 response */
-		struct buffer *err_msg = &p->errmsg[HTTP_ERR_500];
-		if (!err_msg->area)
-			err_msg = &http_err_chunks[HTTP_ERR_500];
-		send(cfd, err_msg->area, err_msg->data,
+		send(cfd, http_err_msgs[HTTP_ERR_500], strlen(http_err_msgs[HTTP_ERR_500]),
 		     MSG_DONTWAIT|MSG_NOSIGNAL);
 	}
 

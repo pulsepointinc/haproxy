@@ -45,6 +45,7 @@
 #include <types/global.h>
 #include <types/dns.h>
 #include <types/stats.h>
+#include <types/peers.h>
 
 #include <proto/activity.h>
 #include <proto/backend.h>
@@ -69,6 +70,9 @@
 #include <proto/stream_interface.h>
 #include <proto/task.h>
 #include <proto/proto_udp.h>
+#ifdef USE_OPENSSL
+#include <proto/ssl_sock.h>
+#endif
 
 #define PAYLOAD_PATTERN "<<"
 
@@ -496,10 +500,19 @@ static int cli_parse_request(struct appctx *appctx)
 
 	appctx->io_handler = kw->io_handler;
 	appctx->io_release = kw->io_release;
-	/* kw->parse could set its own io_handler or ip_release handler */
-	if ((!kw->parse || kw->parse(args, payload, appctx, kw->private) == 0) && appctx->io_handler) {
-		appctx->st0 = CLI_ST_CALLBACK;
-	}
+
+	if (kw->parse && kw->parse(args, payload, appctx, kw->private) != 0)
+		goto fail;
+
+	/* kw->parse could set its own io_handler or io_release handler */
+	if (!appctx->io_handler)
+		goto fail;
+
+	appctx->st0 = CLI_ST_CALLBACK;
+	return 1;
+fail:
+	appctx->io_handler = NULL;
+	appctx->io_release = NULL;
 	return 1;
 }
 
@@ -747,7 +760,7 @@ static void cli_io_handler(struct appctx *appctx)
 						prompt = "\n> ";
 				}
 				else {
-					if (!(appctx->st1 & APPCTX_CLI_ST1_PAYLOAD))
+					if (!(appctx->st1 & (APPCTX_CLI_ST1_PAYLOAD|APPCTX_CLI_ST1_NOLF)))
 						prompt = "\n";
 				}
 
@@ -774,6 +787,8 @@ static void cli_io_handler(struct appctx *appctx)
 
 			/* switch state back to GETREQ to read next requests */
 			appctx->st0 = CLI_ST_GETREQ;
+			/* reactivate the \n at the end of the response for the next command */
+			appctx->st1 &= ~APPCTX_CLI_ST1_NOLF;
 		}
 	}
 
@@ -935,6 +950,12 @@ static int cli_io_handler_show_fd(struct appctx *appctx)
 			     (fdt.iocb == listener_accept)  ? "listener_accept" :
 			     (fdt.iocb == poller_pipe_io_handler) ? "poller_pipe_io_handler" :
 			     (fdt.iocb == mworker_accept_wrapper) ? "mworker_accept_wrapper" :
+#ifdef USE_OPENSSL
+#if (OPENSSL_VERSION_NUMBER >= 0x1010000fL) && !defined(OPENSSL_NO_ASYNC)
+			     (fdt.iocb == ssl_async_fd_free) ? "ssl_async_fd_free" :
+			     (fdt.iocb == ssl_async_fd_handler) ? "ssl_async_fd_handler" :
+#endif
+#endif
 			     "unknown");
 
 		if (fdt.iocb == conn_fd_handler) {
@@ -998,7 +1019,7 @@ static int cli_io_handler_show_activity(struct appctx *appctx)
 
 	chunk_reset(&trash);
 
-	chunk_appendf(&trash, "thread_id: %u", tid);
+	chunk_appendf(&trash, "thread_id: %u (%u..%u)", tid + 1, 1, global.nbthread);
 	chunk_appendf(&trash, "\ndate_now: %lu.%06lu", (long)now.tv_sec, (long)now.tv_usec);
 	chunk_appendf(&trash, "\nloops:");        for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].loops);
 	chunk_appendf(&trash, "\nwake_cache:");   for (thr = 0; thr < global.nbthread; thr++) chunk_appendf(&trash, " %u", activity[thr].wake_cache);
@@ -1078,15 +1099,19 @@ static int cli_io_handler_show_cli_sock(struct appctx *appctx)
 							const struct sockaddr_un *un;
 
 							un = (struct sockaddr_un *)&l->addr;
-							chunk_appendf(&trash, "%s ", un->sun_path);
+							if (un->sun_path[0] == '\0') {
+								chunk_appendf(&trash, "abns@%s ", un->sun_path+1);
+							} else {
+								chunk_appendf(&trash, "unix@%s ", un->sun_path);
+							}
 						} else if (l->addr.ss_family == AF_INET) {
 							addr_to_str(&l->addr, addr, sizeof(addr));
 							port_to_str(&l->addr, port, sizeof(port));
-							chunk_appendf(&trash, "%s:%s ", addr, port);
+							chunk_appendf(&trash, "ipv4@%s:%s ", addr, port);
 						} else if (l->addr.ss_family == AF_INET6) {
 							addr_to_str(&l->addr, addr, sizeof(addr));
 							port_to_str(&l->addr, port, sizeof(port));
-							chunk_appendf(&trash, "[%s]:%s ", addr, port);
+							chunk_appendf(&trash, "ipv6@[%s]:%s ", addr, port);
 						} else if (l->addr.ss_family == AF_CUST_SOCKPAIR) {
 							chunk_appendf(&trash, "sockpair@%d ", ((struct sockaddr_in *)&l->addr)->sin_addr.s_addr);
 						} else
@@ -1307,6 +1332,10 @@ static int cli_parse_show_lvl(char **args, char *payload, struct appctx *appctx,
 /* parse and set the CLI level dynamically */
 static int cli_parse_set_lvl(char **args, char *payload, struct appctx *appctx, void *private)
 {
+	/* this will ask the applet to not output a \n after the command */
+	if (!strcmp(args[1], "-"))
+	    appctx->st1 |= APPCTX_CLI_ST1_NOLF;
+
 	if (!strcmp(args[0], "operator")) {
 		if (!cli_has_level(appctx, ACCESS_LVL_OPER)) {
 			return 1;
@@ -1537,6 +1566,7 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 	int *tmpfd;
 	int tot_fd_nb = 0;
 	struct proxy *px;
+	struct peers *prs;
 	int i = 0;
 	int fd = -1;
 	int curoff = 0;
@@ -1589,6 +1619,22 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 		}
 		px = px->next;
 	}
+	prs = cfg_peers;
+	while (prs) {
+		if (prs->peers_fe) {
+			struct listener *l;
+
+			list_for_each_entry(l, &prs->peers_fe->conf.listeners, by_fe) {
+				/* Only transfer IPv4/IPv6/UNIX sockets */
+				if (l->state >= LI_ZOMBIE &&
+				    (l->proto->sock_family == AF_INET ||
+				     l->proto->sock_family == AF_INET6 ||
+				     l->proto->sock_family == AF_UNIX))
+					tot_fd_nb++;
+			}
+		}
+		prs = prs->next;
+	}
 	if (tot_fd_nb == 0)
 		goto out;
 
@@ -1612,7 +1658,6 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 	cmsg->cmsg_type = SCM_RIGHTS;
 	tmpfd = (int *)CMSG_DATA(cmsg);
 
-	px = proxies_list;
 	/* For each socket, e message is sent, containing the following :
 	 *  Size of the namespace name (or 0 if none), as an unsigned char.
 	 *  The namespace name, if any
@@ -1629,6 +1674,7 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 		goto out;
 	}
 	iov.iov_base = tmpbuf;
+	px = proxies_list;
 	while (px) {
 		struct listener *l;
 
@@ -1662,7 +1708,6 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 				    sizeof(l->options));
 				curoff += sizeof(l->options);
 
-
 				i++;
 			} else
 				continue;
@@ -1683,10 +1728,70 @@ static int _getsocks(char **args, char *payload, struct appctx *appctx, void *pr
 				}
 				curoff = 0;
 			}
-
 		}
 		px = px->next;
 	}
+	/* should be done for peers too */
+	prs = cfg_peers;
+	while (prs) {
+		if (prs->peers_fe) {
+			struct listener *l;
+
+			list_for_each_entry(l, &prs->peers_fe->conf.listeners, by_fe) {
+				int ret;
+				/* Only transfer IPv4/IPv6 sockets */
+				if (l->state >= LI_ZOMBIE &&
+				    (l->proto->sock_family == AF_INET ||
+				     l->proto->sock_family == AF_INET6 ||
+				     l->proto->sock_family == AF_UNIX)) {
+					memcpy(&tmpfd[i % MAX_SEND_FD], &l->fd, sizeof(l->fd));
+					if (!l->netns)
+						tmpbuf[curoff++] = 0;
+#ifdef USE_NS
+					else {
+						char *name = l->netns->node.key;
+						unsigned char len = l->netns->name_len;
+						tmpbuf[curoff++] = len;
+						memcpy(tmpbuf + curoff, name, len);
+						curoff += len;
+					}
+#endif
+					if (l->interface) {
+						unsigned char len = strlen(l->interface);
+						tmpbuf[curoff++] = len;
+						memcpy(tmpbuf + curoff, l->interface, len);
+						curoff += len;
+					} else
+						tmpbuf[curoff++] = 0;
+					memcpy(tmpbuf + curoff, &l->options,
+					       sizeof(l->options));
+					curoff += sizeof(l->options);
+
+					i++;
+				} else
+					continue;
+				if ((!(i % MAX_SEND_FD))) {
+					iov.iov_len = curoff;
+					if (sendmsg(fd, &msghdr, 0) != curoff) {
+						ha_warning("Failed to transfer sockets\n");
+						goto out;
+					}
+					/* Wait for an ack */
+					do {
+						ret = recv(fd, &tot_fd_nb,
+							   sizeof(tot_fd_nb), 0);
+					} while (ret == -1 && errno == EINTR);
+					if (ret <= 0) {
+						ha_warning("Unexpected error while transferring sockets\n");
+						goto out;
+					}
+					curoff = 0;
+				}
+			}
+		}
+		prs = prs->next;
+	}
+
 	if (i % MAX_SEND_FD) {
 		iov.iov_len = curoff;
 		cmsg->cmsg_len = CMSG_LEN((i % MAX_SEND_FD) * sizeof(int));
@@ -2032,11 +2137,11 @@ int pcli_parse_request(struct stream *s, struct channel *req, char **errmsg, int
 		if (pcli_has_level(s, ACCESS_LVL_ADMIN)) {
 			goto end;
 		} else if (pcli_has_level(s, ACCESS_LVL_OPER)) {
-			ci_insert_line2(req, 0, "operator", strlen("operator"));
-			ret += strlen("operator") + 2;
+			ci_insert_line2(req, 0, "operator -", strlen("operator -"));
+			ret += strlen("operator -") + 2;
 		} else if (pcli_has_level(s, ACCESS_LVL_USER)) {
-			ci_insert_line2(req, 0, "user", strlen("user"));
-			ret += strlen("user") + 2;
+			ci_insert_line2(req, 0, "user -", strlen("user -"));
+			ret += strlen("user -") + 2;
 		}
 	}
 end:
@@ -2449,7 +2554,7 @@ int mworker_cli_proxy_new_listener(char *line)
 	int arg;
 	int cur_arg;
 
-	arg = 0;
+	arg = 1;
 	args[0] = line;
 
 	/* args is a bind configuration with spaces replaced by commas */
@@ -2459,12 +2564,12 @@ int mworker_cli_proxy_new_listener(char *line)
 			*line++ = '\0';
 			while (*line == ',')
 				line++;
-			args[++arg] = line;
+			args[arg++] = line;
 		}
 		line++;
 	}
 
-	args[++arg] = "\0";
+	args[arg] = "\0";
 
 	bind_conf = bind_conf_alloc(mworker_proxy, "master-socket", 0, "", xprt_get(XPRT_RAW));
 	if (!bind_conf)

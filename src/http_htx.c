@@ -51,6 +51,24 @@ struct htx_sl *http_find_stline(struct htx *htx)
 	return sl;
 }
 
+/* Returns the headers size in the HTX message */
+size_t http_get_hdrs_size(struct htx *htx)
+{
+	struct htx_blk *blk;
+	size_t sz = 0;
+
+	blk = htx_get_head_blk(htx);
+	if (!blk || htx_get_blk_type(blk) > HTX_BLK_EOH)
+		return sz;
+
+	for (; blk; blk = htx_get_next_blk(htx, blk)) {
+		sz += htx_get_blksz(blk);
+		if (htx_get_blk_type(blk) == HTX_BLK_EOH)
+			break;
+	}
+	return sz;
+}
+
 /* Finds the first or next occurrence of header <name> in the HTX message <htx>
  * using the context <ctx>. This structure holds everything necessary to use the
  * header and find next occurrence. If its <blk> member is NULL, the header is
@@ -127,8 +145,6 @@ int http_find_header(const struct htx *htx, const struct ist name,
 			v.len--;
 			ctx->lws_after++;
 		}
-		if (!v.len)
-			goto next_blk;
 		ctx->blk   = blk;
 		ctx->value = v;
 		return 1;
@@ -183,6 +199,10 @@ int http_add_header(struct htx *htx, const struct ist n, const struct ist v)
 
 		blk = pblk;
 	}
+
+	if (htx_get_blk_pos(htx, blk) != htx->front)
+		htx_defrag(htx, NULL);
+
 	return 1;
 }
 
@@ -220,6 +240,9 @@ int http_replace_req_meth(struct htx *htx, const struct ist meth)
 	struct htx_sl *sl = http_find_stline(htx);
 	struct ist uri, vsn;
 
+	if (!sl)
+		return 0;
+
 	/* Start by copying old uri and version */
 	chunk_memcat(temp, HTX_SL_REQ_UPTR(sl), HTX_SL_REQ_ULEN(sl)); /* uri */
 	uri = ist2(temp->area, HTX_SL_REQ_ULEN(sl));
@@ -241,6 +264,9 @@ int http_replace_req_uri(struct htx *htx, const struct ist uri)
 	struct htx_sl *sl = http_find_stline(htx);
 	struct ist meth, vsn;
 
+	if (!sl)
+		return 0;
+
 	/* Start by copying old method and version */
 	chunk_memcat(temp, HTX_SL_REQ_MPTR(sl), HTX_SL_REQ_MLEN(sl)); /* meth */
 	meth = ist2(temp->area, HTX_SL_REQ_MLEN(sl));
@@ -261,6 +287,9 @@ int http_replace_req_path(struct htx *htx, const struct ist path)
 	struct htx_sl *sl = http_find_stline(htx);
 	struct ist meth, uri, vsn, p;
 	size_t plen = 0;
+
+	if (!sl)
+		return 0;
 
 	uri = htx_sl_req_uri(sl);
 	p = http_get_path(uri);
@@ -295,6 +324,9 @@ int http_replace_req_query(struct htx *htx, const struct ist query)
 	struct htx_sl *sl = http_find_stline(htx);
 	struct ist meth, uri, vsn, q;
 	int offset = 1;
+
+	if (!sl)
+		return 0;
 
 	uri = htx_sl_req_uri(sl);
 	q = uri;
@@ -337,6 +369,9 @@ int http_replace_res_status(struct htx *htx, const struct ist status)
 	struct htx_sl *sl = http_find_stline(htx);
 	struct ist vsn, reason;
 
+	if (!sl)
+		return 0;
+
 	/* Start by copying old uri and version */
 	chunk_memcat(temp, HTX_SL_RES_VPTR(sl), HTX_SL_RES_VLEN(sl)); /* vsn */
 	vsn = ist2(temp->area, HTX_SL_RES_VLEN(sl));
@@ -357,6 +392,9 @@ int http_replace_res_reason(struct htx *htx, const struct ist reason)
 	struct buffer *temp = get_trash_chunk();
 	struct htx_sl *sl = http_find_stline(htx);
 	struct ist vsn, status;
+
+	if (!sl)
+		return 0;
 
 	/* Start by copying old uri and version */
 	chunk_memcat(temp, HTX_SL_RES_VPTR(sl), HTX_SL_RES_VLEN(sl)); /* vsn */
@@ -619,21 +657,27 @@ unsigned int http_get_htx_fhdr(const struct htx *htx, const struct ist hdr,
 	return 1;
 }
 
-static struct htx *http_str_to_htx(struct buffer *buf, struct ist raw)
+int http_str_to_htx(struct buffer *buf, struct ist raw)
 {
 	struct htx *htx;
 	struct htx_sl *sl;
 	struct h1m h1m;
-	struct http_hdr hdrs[MAX_HTTP_HDR];
+	struct http_hdr hdrs[global.tune.max_http_hdr];
 	union h1_sl h1sl;
 	unsigned int flags = HTX_SL_F_IS_RESP;
 	int ret = 0;
+
+	b_reset(buf);
+	if (!raw.len) {
+		buf->size = 0;
+		buf->area = malloc(raw.len);
+		return 1;
+	}
 
 	buf->size = global.tune.bufsize;
 	buf->area = (char *)malloc(buf->size);
 	if (!buf->area)
 		goto error;
-	b_reset(buf);
 
 	h1m_init_res(&h1m);
 	h1m.flags |= H1_MF_NO_PHDR;
@@ -652,16 +696,13 @@ static struct htx *http_str_to_htx(struct buffer *buf, struct ist raw)
 		flags |= HTX_SL_F_VER_11;
 	if (h1m.flags & H1_MF_XFER_ENC)
 		flags |= HTX_SL_F_XFER_ENC;
-	if (h1m.flags & H1_MF_XFER_LEN) {
-		flags |= HTX_SL_F_XFER_LEN;
-		if (h1m.flags & H1_MF_CHNK)
-			goto error; /* Unsupported because there is no body parsing */
-		else if (h1m.flags & H1_MF_CLEN) {
-			flags |= HTX_SL_F_CLEN;
-			if (h1m.body_len == 0)
-				flags |= HTX_SL_F_BODYLESS;
-		}
+	if (h1m.flags & H1_MF_CLEN) {
+		flags |= (HTX_SL_F_XFER_LEN|HTX_SL_F_CLEN);
+		if (h1m.body_len == 0)
+			flags |= HTX_SL_F_BODYLESS;
 	}
+	if (h1m.flags & H1_MF_CHNK)
+		goto error; /* Unsupported because there is no body parsing */
 
 	htx = htx_from_buf(buf);
 	sl = htx_add_stline(htx, HTX_BLK_RES_SL, flags, h1sl.st.v, h1sl.st.c, h1sl.st.r);
@@ -675,12 +716,13 @@ static struct htx *http_str_to_htx(struct buffer *buf, struct ist raw)
 	}
 	if (!htx_add_endof(htx, HTX_BLK_EOM))
 		goto error;
-	return htx;
+
+	return 1;
 
 error:
 	if (buf->size)
 		free(buf->area);
-	return NULL;
+	return 0;
 }
 
 static int http_htx_init(void)
@@ -692,7 +734,7 @@ static int http_htx_init(void)
 	int err_code = 0;
 
 	for (px = proxies_list; px; px = px->next) {
-		if (!(px->options2 & PR_O2_USE_HTX))
+		if (px->mode != PR_MODE_HTTP || !(px->options2 & PR_O2_USE_HTX))
 			continue;
 
 		for (rc = 0; rc < HTTP_ERR_SIZE; rc++) {

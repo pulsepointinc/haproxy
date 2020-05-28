@@ -80,6 +80,9 @@ INITCALL1(STG_REGISTER, protocol_register, &proto_sockpair);
 /* Add <listener> to the list of sockpair listeners (port is ignored). The
  * listener's state is automatically updated from LI_INIT to LI_ASSIGNED.
  * The number of listeners for the protocol is updated.
+ *
+ * Must be called with proto_lock held.
+ *
  */
 static void sockpair_add_listener(struct listener *listener, int port)
 {
@@ -96,6 +99,8 @@ static void sockpair_add_listener(struct listener *listener, int port)
  * The sockets will be registered but not added to any fd_set, in order not to
  * loose them across the fork(). A call to uxst_enable_listeners() is needed
  * to complete initialization.
+ *
+ * Must be called with proto_lock held.
  *
  * The return value is composed from ERR_NONE, ERR_RETRYABLE and ERR_FATAL.
  */
@@ -153,8 +158,8 @@ static int sockpair_bind_listener(struct listener *listener, char *errmsg, int e
 	listener->state = LI_LISTEN;
 
 	fd_insert(fd, listener, listener->proto->accept,
-		  listener->bind_conf->bind_thread[relative_pid-1] ?
-		  listener->bind_conf->bind_thread[relative_pid-1] : MAX_THREADS_MASK);
+		  (listener->bind_conf->bind_thread[relative_pid-1] ?
+		   listener->bind_conf->bind_thread[relative_pid-1] : MAX_THREADS_MASK) & all_threads_mask);
 
 	return err;
 

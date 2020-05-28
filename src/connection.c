@@ -472,7 +472,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 	char *line, *end;
 	struct proxy_hdr_v2 *hdr_v2;
 	const char v2sig[] = PP2_SIGNATURE;
-	int tlv_length = 0;
+	size_t total_v2_len;
 	int tlv_offset = 0;
 	int ret;
 
@@ -484,7 +484,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		goto fail;
 
 	if (!fd_recv_ready(conn->handle.fd))
-		return 0;
+		goto not_ready;
 
 	do {
 		ret = recv(conn->handle.fd, trash.area, trash.size, MSG_PEEK);
@@ -493,7 +493,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 				continue;
 			if (errno == EAGAIN) {
 				fd_cant_recv(conn->handle.fd);
-				return 0;
+				goto not_ready;
 			}
 			goto recv_abort;
 		}
@@ -594,7 +594,6 @@ int conn_recv_proxy(struct connection *conn, int flag)
 			}
 			line++;
 		}
-		__conn_xprt_stop_recv(conn);
 
 		if (!dst_s || !sport_s || !dport_s)
 			goto bad_header;
@@ -649,7 +648,8 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		goto fail;
 	}
 
-	if (trash.data < PP2_HEADER_LEN + ntohs(hdr_v2->len))
+	total_v2_len = PP2_HEADER_LEN + ntohs(hdr_v2->len);
+	if (trash.data < total_v2_len)
 		goto missing;
 
 	switch (hdr_v2->ver_cmd & PP2_CMD_MASK) {
@@ -667,7 +667,6 @@ int conn_recv_proxy(struct connection *conn, int flag)
 			((struct sockaddr_in *)&conn->addr.to)->sin_port = hdr_v2->addr.ip4.dst_port;
 			conn->flags |= CO_FL_ADDR_FROM_SET | CO_FL_ADDR_TO_SET;
 			tlv_offset = PP2_HEADER_LEN + PP2_ADDR_LEN_INET;
-			tlv_length = ntohs(hdr_v2->len) - PP2_ADDR_LEN_INET;
 			break;
 		case 0x21:  /* TCPv6 */
 			if (ntohs(hdr_v2->len) < PP2_ADDR_LEN_INET6)
@@ -681,40 +680,63 @@ int conn_recv_proxy(struct connection *conn, int flag)
 			((struct sockaddr_in6 *)&conn->addr.to)->sin6_port = hdr_v2->addr.ip6.dst_port;
 			conn->flags |= CO_FL_ADDR_FROM_SET | CO_FL_ADDR_TO_SET;
 			tlv_offset = PP2_HEADER_LEN + PP2_ADDR_LEN_INET6;
-			tlv_length = ntohs(hdr_v2->len) - PP2_ADDR_LEN_INET6;
 			break;
 		}
 
 		/* TLV parsing */
-		if (tlv_length > 0) {
-			while (tlv_offset + TLV_HEADER_SIZE <= trash.data) {
-				const struct tlv *tlv_packet = (struct tlv *) &trash.area[tlv_offset];
-				const int tlv_len = get_tlv_length(tlv_packet);
-				tlv_offset += tlv_len + TLV_HEADER_SIZE;
+		while (tlv_offset < total_v2_len) {
+			struct tlv *tlv_packet;
+			int tlv_len;
 
-				switch (tlv_packet->type) {
-				case PP2_TYPE_CRC32C: {
-					void *tlv_crc32c_p = (void *)tlv_packet->value;
-					uint32_t n_crc32c = ntohl(read_u32(tlv_crc32c_p));
-					write_u32(tlv_crc32c_p, 0);
-					if (hash_crc32c(trash.area, PP2_HEADER_LEN + ntohs(hdr_v2->len)) != n_crc32c)
-						goto bad_header;
-					break;
-				}
+			/* Verify that we have at least TLV_HEADER_SIZE bytes left */
+			if (tlv_offset + TLV_HEADER_SIZE > total_v2_len)
+				goto bad_header;
+
+			tlv_packet = (struct tlv *) &trash.area[tlv_offset];
+			tlv_len = get_tlv_length(tlv_packet);
+			tlv_offset += tlv_len + TLV_HEADER_SIZE;
+
+			/* Verify that the TLV length does not exceed the total PROXYv2 length */
+			if (tlv_offset > total_v2_len)
+				goto bad_header;
+
+			switch (tlv_packet->type) {
+			case PP2_TYPE_CRC32C: {
+				uint32_t n_crc32c;
+
+				/* Verify that this TLV is exactly 4 bytes long */
+				if (tlv_len != 4)
+					goto bad_header;
+
+				n_crc32c = read_n32(tlv_packet->value);
+				write_n32(tlv_packet->value, 0); // compute with CRC==0
+
+				if (hash_crc32c(trash.area, total_v2_len) != n_crc32c)
+					goto bad_header;
+				break;
+			}
 #ifdef CONFIG_HAP_NS
-				case PP2_TYPE_NETNS: {
-					const struct netns_entry *ns;
-					ns = netns_store_lookup((char*)tlv_packet->value, tlv_len);
-					if (ns)
-						conn->proxy_netns = ns;
-					break;
-				}
+			case PP2_TYPE_NETNS: {
+				const struct netns_entry *ns;
+
+				ns = netns_store_lookup((char*)tlv_packet->value, tlv_len);
+				if (ns)
+					conn->proxy_netns = ns;
+				break;
+			}
 #endif
-				default:
-					break;
-				}
+			default:
+				break;
 			}
 		}
+
+		/* Verify that the PROXYv2 header ends at a TLV boundary.
+		 * This is technically unreachable, because the TLV parsing already
+		 * verifies that a TLV does not exceed the total length and also
+		 * that there is space for a TLV header.
+		 */
+		if (tlv_offset != total_v2_len)
+			goto bad_header;
 
 		/* unsupported protocol, keep local connection address */
 		break;
@@ -725,7 +747,7 @@ int conn_recv_proxy(struct connection *conn, int flag)
 		goto bad_header; /* not a supported command */
 	}
 
-	trash.data = PP2_HEADER_LEN + ntohs(hdr_v2->len);
+	trash.data = total_v2_len;
 	goto eat_header;
 
  eat_header:
@@ -743,7 +765,13 @@ int conn_recv_proxy(struct connection *conn, int flag)
 
 	conn->flags &= ~flag;
 	conn->flags |= CO_FL_RCVD_PROXY;
+	__conn_sock_stop_recv(conn);
 	return 1;
+
+ not_ready:
+	__conn_sock_want_recv(conn);
+	__conn_sock_stop_send(conn);
+	return 0;
 
  missing:
 	/* Missing data. Since we're using MSG_PEEK, we can only poll again if
@@ -789,7 +817,7 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 {
 	char *line;
 	uint32_t hdr_len;
-	uint8_t ip_v;
+	uint8_t ip_ver;
 	int ret;
 
 	/* we might have been called just after an asynchronous shutr */
@@ -800,7 +828,7 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 		goto fail;
 
 	if (!fd_recv_ready(conn->handle.fd))
-		return 0;
+		goto not_ready;
 
 	do {
 		ret = recv(conn->handle.fd, trash.area, trash.size, MSG_PEEK);
@@ -809,7 +837,7 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 				continue;
 			if (errno == EAGAIN) {
 				fd_cant_recv(conn->handle.fd);
-				return 0;
+				goto not_ready;
 			}
 			goto recv_abort;
 		}
@@ -857,9 +885,9 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 		goto missing;
 
 	/* Get IP version from the first four bits */
-	ip_v = (*line & 0xf0) >> 4;
+	ip_ver = (*line & 0xf0) >> 4;
 
-	if (ip_v == 4) {
+	if (ip_ver == 4) {
 		struct ip *hdr_ip4;
 		struct my_tcphdr *hdr_tcp;
 
@@ -889,7 +917,7 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 
 		conn->flags |= CO_FL_ADDR_FROM_SET | CO_FL_ADDR_TO_SET;
 	}
-	else if (ip_v == 6) {
+	else if (ip_ver == 6) {
 		struct ip6_hdr *hdr_ip6;
 		struct my_tcphdr *hdr_tcp;
 
@@ -941,7 +969,13 @@ int conn_recv_netscaler_cip(struct connection *conn, int flag)
 	} while (0);
 
 	conn->flags &= ~flag;
+	__conn_sock_stop_recv(conn);
 	return 1;
+
+ not_ready:
+	__conn_sock_want_recv(conn);
+	__conn_sock_stop_send(conn);
+	return 0;
 
  missing:
 	/* Missing data. Since we're using MSG_PEEK, we can only poll again if
@@ -1112,11 +1146,18 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 		ret = PP2_HDR_LEN_UNSPEC;
 	}
 	else {
+		/* Note: due to historic compatibility with V1 which required
+		 * to send "PROXY" with local addresses for local connections,
+		 * we can end up here with the remote in fact being our outgoing
+		 * connection. We still want to send real addresses and LOCAL on
+		 * it.
+		 */
+		hdr->ver_cmd = PP2_VERSION;
+		hdr->ver_cmd |= conn_is_back(remote) ? PP2_CMD_LOCAL : PP2_CMD_PROXY;
 		/* IPv4 for both src and dst */
 		if (src->ss_family == AF_INET && dst->ss_family == AF_INET) {
 			if (buf_len < PP2_HDR_LEN_INET)
 				return 0;
-			hdr->ver_cmd = PP2_VERSION | PP2_CMD_PROXY;
 			hdr->fam = PP2_FAM_INET | PP2_TRANS_STREAM;
 			hdr->addr.ip4.src_addr = ((struct sockaddr_in *)src)->sin_addr.s_addr;
 			hdr->addr.ip4.src_port = ((struct sockaddr_in *)src)->sin_port;
@@ -1130,7 +1171,6 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 
 			if (buf_len < PP2_HDR_LEN_INET6)
 				return 0;
-			hdr->ver_cmd = PP2_VERSION | PP2_CMD_PROXY;
 			hdr->fam = PP2_FAM_INET6 | PP2_TRANS_STREAM;
 			if (src->ss_family == AF_INET) {
 				v4tov6(&tmp, &((struct sockaddr_in *)src)->sin_addr);
@@ -1144,7 +1184,7 @@ int make_proxy_line_v2(char *buf, int buf_len, struct server *srv, struct connec
 			if (dst->ss_family == AF_INET) {
 				v4tov6(&tmp, &((struct sockaddr_in *)dst)->sin_addr);
 				memcpy(hdr->addr.ip6.dst_addr, &tmp, 16);
-				hdr->addr.ip6.src_port = ((struct sockaddr_in *)src)->sin_port;
+				hdr->addr.ip6.dst_port = ((struct sockaddr_in *)dst)->sin_port;
 			}
 			else {
 				memcpy(hdr->addr.ip6.dst_addr, &((struct sockaddr_in6 *)dst)->sin6_addr, 16);

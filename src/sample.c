@@ -920,6 +920,8 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 
 	while (1) {
 		struct sample_conv_expr *conv_expr;
+		int err_arg;
+		int argcnt;
 
 		if (*endt == ')') /* skip last closing parenthesis */
 			endt++;
@@ -962,6 +964,7 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		endt = endw;
 		if (*endt == '(') {
 			/* look for the end of this term */
+			endt = ++endw;
 			while (*endt && *endt != ')')
 				endt++;
 			if (*endt != ')') {
@@ -989,31 +992,24 @@ struct sample_expr *sample_parse_expr(char **str, int *idx, const char *file, in
 		LIST_ADDQ(&(expr->conv_exprs), &(conv_expr->list));
 		conv_expr->conv = conv;
 
-		if (endt != endw) {
-			int err_arg;
-
-			if (!conv->arg_mask) {
-				memprintf(err_msg, "converter '%s' does not support any args", ckw);
-				goto out_error;
-			}
-
-			al->kw = expr->fetch->kw;
-			al->conv = conv_expr->conv->kw;
-			if (make_arg_list(endw + 1, endt - endw - 1, conv->arg_mask, &conv_expr->arg_p, err_msg, NULL, &err_arg, al) < 0) {
-				memprintf(err_msg, "invalid arg %d in converter '%s' : %s", err_arg+1, ckw, *err_msg);
-				goto out_error;
-			}
-
-			if (!conv_expr->arg_p)
-				conv_expr->arg_p = empty_arg_list;
-
-			if (conv->val_args && !conv->val_args(conv_expr->arg_p, conv, file, line, err_msg)) {
-				memprintf(err_msg, "invalid args in converter '%s' : %s", ckw, *err_msg);
-				goto out_error;
-			}
+		al->kw = expr->fetch->kw;
+		al->conv = conv_expr->conv->kw;
+		argcnt = make_arg_list(endw, endt - endw, conv->arg_mask, &conv_expr->arg_p, err_msg, NULL, &err_arg, al);
+		if (argcnt < 0) {
+			memprintf(err_msg, "invalid arg %d in converter '%s' : %s", err_arg+1, ckw, *err_msg);
+			goto out_error;
 		}
-		else if (ARGM(conv->arg_mask)) {
-			memprintf(err_msg, "missing args for converter '%s'", ckw);
+
+		if (argcnt && !conv->arg_mask) {
+			memprintf(err_msg, "converter '%s' does not support any args", ckw);
+			goto out_error;
+		}
+
+		if (!conv_expr->arg_p)
+			conv_expr->arg_p = empty_arg_list;
+
+		if (conv->val_args && !conv->val_args(conv_expr->arg_p, conv, file, line, err_msg)) {
+			memprintf(err_msg, "invalid args in converter '%s' : %s", ckw, *err_msg);
 			goto out_error;
 		}
 	}
@@ -1264,6 +1260,13 @@ int smp_resolve_args(struct proxy *p)
 				break;
 			}
 
+			if (p->bind_proc & ~px->bind_proc) {
+				ha_alert("parsing [%s:%d] : stick-table '%s' not present on all processes covered by proxy '%s'.\n",
+					 cur->file, cur->line, px->id, p->id);
+				cfgerr++;
+				break;
+			}
+
 			free(arg->data.str.area);
 			arg->data.str.area = NULL;
 			arg->unresolved = 0;
@@ -1460,7 +1463,7 @@ static int sample_conv_debug(const struct arg *arg_p, struct sample *smp, void *
 
 			else {
 				/* Display the displayable chars*. */
-				fprintf(stderr, "<");
+				fputc('<', stderr);
 				for (i = 0; i < tmp.data.u.str.data; i++) {
 					if (isprint(tmp.data.u.str.area[i]))
 						fputc(tmp.data.u.str.area[i],
@@ -1468,9 +1471,10 @@ static int sample_conv_debug(const struct arg *arg_p, struct sample *smp, void *
 					else
 						fputc('.', stderr);
 				}
+				fputc('>', stderr);
 			}
-			fprintf(stderr, ">\n");
 		}
+		fputc('\n', stderr);
 	}
 	return 1;
 }
@@ -1936,7 +1940,8 @@ static int sample_conv_json(const struct arg *arg_p, struct sample *smp, void *p
 		}
 		else {
 			len = 1;
-			str = (char *)&c;
+			_str[0] = c;
+			str = _str;
 		}
 
 		/* Check length */
@@ -2070,7 +2075,7 @@ static int sample_conv_field(const struct arg *arg_p, struct sample *smp, void *
 	/* Field not found */
 	if (field != arg_p[0].data.sint) {
 		smp->data.u.str.data = 0;
-		return 1;
+		return 0;
 	}
 found:
 	smp->data.u.str.data = end - start;

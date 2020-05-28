@@ -50,7 +50,6 @@ static void srv_update_status(struct server *s);
 static void srv_update_state(struct server *srv, int version, char **params);
 static int srv_apply_lastaddr(struct server *srv, int *err_code);
 static int srv_set_fqdn(struct server *srv, const char *fqdn, int dns_locked);
-static struct task *cleanup_idle_connections(struct task *task, void *ctx, unsigned short state);
 
 /* List head of all known server keywords */
 static struct srv_kw_list srv_keywords = {
@@ -112,7 +111,7 @@ static inline void srv_check_for_dup_dyncookie(struct server *s)
 }
 
 /*
- * Must be called with the server lock held.
+ * Must be called with the server lock held, and will grab the proxy lock.
  */
 void srv_set_dyncookie(struct server *s)
 {
@@ -124,15 +123,17 @@ void srv_set_dyncookie(struct server *s)
 	int addr_len;
 	int port;
 
+	HA_SPIN_LOCK(PROXY_LOCK, &p->lock);
+
 	if ((s->flags & SRV_F_COOKIESET) ||
 	    !(s->proxy->ck_opts & PR_CK_DYNAMIC) ||
 	    s->proxy->dyncookie_key == NULL)
-		return;
+		goto out;
 	key_len = strlen(p->dyncookie_key);
 
 	if (s->addr.ss_family != AF_INET &&
 	    s->addr.ss_family != AF_INET6)
-		return;
+		goto out;
 	/*
 	 * Buffer to calculate the cookie value.
 	 * The buffer contains the secret key + the server IP address
@@ -161,7 +162,7 @@ void srv_set_dyncookie(struct server *s)
 	hash_value = XXH64(tmpbuf, buffer_len, 0);
 	memprintf(&s->cookie, "%016llx", hash_value);
 	if (!s->cookie)
-		return;
+		goto out;
 	s->cklen = 16;
 
 	/* Don't bother checking if the dyncookie is duplicated if
@@ -170,6 +171,8 @@ void srv_set_dyncookie(struct server *s)
 	 */
 	if (!(s->next_admin & SRV_ADMF_FMAINT))
 		srv_check_for_dup_dyncookie(s);
+ out:
+	HA_SPIN_UNLOCK(PROXY_LOCK, &p->lock);
 }
 
 /*
@@ -358,6 +361,20 @@ static int srv_parse_enabled(char **args, int *cur_arg,
 	return 0;
 }
 
+static int srv_parse_max_reuse(char **args, int *cur_arg, struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	char *arg;
+
+	arg = args[*cur_arg + 1];
+	if (!*arg) {
+		memprintf(err, "'%s' expects <value> as argument.\n", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	newsrv->max_reuse = atoi(arg);
+
+	return 0;
+}
+
 static int srv_parse_pool_purge_delay(char **args, int *cur_arg, struct proxy *curproxy, struct server *newsrv, char **err)
 {
 	const char *res;
@@ -389,7 +406,12 @@ static int srv_parse_pool_max_conn(char **args, int *cur_arg, struct proxy *curp
 		memprintf(err, "'%s' expects <value> as argument.\n", args[*cur_arg]);
 		return ERR_ALERT | ERR_FATAL;
 	}
+
 	newsrv->max_idle_conns = atoi(arg);
+	if ((int)newsrv->max_idle_conns < -1) {
+		memprintf(err, "'%s' must be >= -1", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
 
 	return 0;
 }
@@ -1234,6 +1256,7 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "disabled",            srv_parse_disabled,            0,  1 }, /* Start the server in 'disabled' state */
 	{ "enabled",             srv_parse_enabled,             0,  1 }, /* Start the server in 'enabled' state */
 	{ "id",                  srv_parse_id,                  1,  0 }, /* set id# of server */
+	{ "max-reuse",           srv_parse_max_reuse,           1,  1 }, /* Set the max number of requests on a connection, -1 means unlimited */
 	{ "namespace",           srv_parse_namespace,           1,  1 }, /* Namespace the server socket belongs to (if supported) */
 	{ "no-agent-check",      srv_parse_no_agent_check,      0,  1 }, /* Do not enable any auxiliary agent check */
 	{ "no-backup",           srv_parse_no_backup,           0,  1 }, /* Flag as non-backup server */
@@ -1609,9 +1632,13 @@ static void srv_settings_cpy(struct server *srv, struct server *src, int srv_tmp
 		srv->cklen  = src->cklen;
 	}
 	srv->use_ssl                  = src->use_ssl;
-	srv->check.addr = srv->agent.addr = src->check.addr;
+	srv->check.addr               = src->check.addr;
+	srv->agent.addr               = src->agent.addr;
 	srv->check.use_ssl            = src->check.use_ssl;
 	srv->check.port               = src->check.port;
+	srv->check.sni                = src->check.sni;
+	srv->check.alpn_str           = src->check.alpn_str;
+	srv->check.alpn_len           = src->check.alpn_len;
 	/* Note: 'flags' field has potentially been already initialized. */
 	srv->flags                   |= src->flags;
 	srv->do_check                 = src->do_check;
@@ -1681,6 +1708,7 @@ static void srv_settings_cpy(struct server *srv, struct server *src, int srv_tmp
 	srv->mux_proto = src->mux_proto;
 	srv->pool_purge_delay = src->pool_purge_delay;
 	srv->max_idle_conns = src->max_idle_conns;
+	srv->max_reuse = src->max_reuse;
 
 	if (srv_tmpl)
 		srv->srvrq = src->srvrq;
@@ -1689,7 +1717,6 @@ static void srv_settings_cpy(struct server *srv, struct server *src, int srv_tmp
 struct server *new_server(struct proxy *proxy)
 {
 	struct server *srv;
-	int i;
 
 	srv = calloc(1, sizeof *srv);
 	if (!srv)
@@ -1700,42 +1727,24 @@ struct server *new_server(struct proxy *proxy)
 	LIST_INIT(&srv->actconns);
 	srv->pendconns = EB_ROOT;
 
-	if ((srv->priv_conns = calloc(global.nbthread, sizeof(*srv->priv_conns))) == NULL)
-		goto free_srv;
-	if ((srv->idle_conns = calloc(global.nbthread, sizeof(*srv->idle_conns))) == NULL)
-		goto free_priv_conns;
-	if ((srv->safe_conns = calloc(global.nbthread, sizeof(*srv->safe_conns))) == NULL)
-		goto free_idle_conns;
-
-	for (i = 0; i < global.nbthread; i++) {
-		LIST_INIT(&srv->priv_conns[i]);
-		LIST_INIT(&srv->idle_conns[i]);
-		LIST_INIT(&srv->safe_conns[i]);
-	}
-
 	srv->next_state = SRV_ST_RUNNING; /* early server setup */
 	srv->last_change = now.tv_sec;
 
 	srv->check.status = HCHK_STATUS_INI;
 	srv->check.server = srv;
+	srv->check.proxy = proxy;
 	srv->check.tcpcheck_rules = &proxy->tcpcheck_rules;
 
 	srv->agent.status = HCHK_STATUS_INI;
 	srv->agent.server = srv;
+	srv->agent.proxy = proxy;
 	srv->xprt  = srv->check.xprt = srv->agent.xprt = xprt_get(XPRT_RAW);
 
 	srv->pool_purge_delay = 1000;
 	srv->max_idle_conns = -1;
+	srv->max_reuse = -1;
 
 	return srv;
-
-  free_idle_conns:
-	free(srv->idle_conns);
-  free_priv_conns:
-	free(srv->priv_conns);
-  free_srv:
-	free(srv);
-	return NULL;
 }
 
 /*
@@ -1933,25 +1942,6 @@ static int server_finalize_init(const char *file, int linenum, char **args, int 
 		px->srv_act++;
 	srv_lb_commit_status(srv);
 
-	if (!srv->tmpl_info.prefix && srv->max_idle_conns != 0) {
-			int i;
-
-			srv->idle_orphan_conns = calloc(global.nbthread, sizeof(*srv->idle_orphan_conns));
-			if (!srv->idle_orphan_conns)
-				goto err;
-			srv->idle_task = calloc(global.nbthread, sizeof(*srv->idle_task));
-			if (!srv->idle_task)
-				goto err;
-			for (i = 0; i < global.nbthread; i++) {
-				LIST_INIT(&srv->idle_orphan_conns[i]);
-				srv->idle_task[i] = task_new(1 << i);
-				if (!srv->idle_task[i])
-					goto err;
-				srv->idle_task[i]->process = cleanup_idle_connections;
-				srv->idle_task[i]->context = srv;
-			}
-		}
-
 	return 0;
 err:
 	return ERR_ALERT | ERR_FATAL;
@@ -2038,24 +2028,6 @@ static int server_template_init(struct server *srv, struct proxy *px)
 		/* Linked backwards first. This will be restablished after parsing. */
 		newsrv->next = px->srv;
 		px->srv = newsrv;
-		if (newsrv->max_idle_conns != 0) {
-			int i;
-
-			newsrv->idle_orphan_conns = calloc(global.nbthread, sizeof(*newsrv->idle_orphan_conns));
-			if (!newsrv->idle_orphan_conns)
-				goto err;
-			newsrv->idle_task = calloc(global.nbthread, sizeof(*newsrv->idle_task));
-			if (!newsrv->idle_task)
-				goto err;
-			for (i = 0; i < global.nbthread; i++) {
-				LIST_INIT(&newsrv->idle_orphan_conns[i]);
-				newsrv->idle_task[i] = task_new(1 << i);
-				if (!newsrv->idle_task[i])
-					goto err;
-				newsrv->idle_task[i]->process = cleanup_idle_connections;
-				newsrv->idle_task[i]->context = newsrv;
-			}
-		}
 	}
 	srv_set_id_from_prefix(srv, srv->tmpl_info.prefix, srv->tmpl_info.nb_low);
 
@@ -3029,16 +3001,37 @@ static void srv_update_state(struct server *srv, int version, char **params)
 			HA_SPIN_LOCK(SERVER_LOCK, &srv->lock);
 			/* recover operational state and apply it to this server
 			 * and all servers tracking this one */
+			srv->check.health = srv_check_health;
 			switch (srv_op_state) {
 				case SRV_ST_STOPPED:
 					srv->check.health = 0;
 					srv_set_stopped(srv, "changed from server-state after a reload", NULL);
 					break;
 				case SRV_ST_STARTING:
+					/* If rise == 1 there is no STARTING state, let's switch to
+					 * RUNNING
+					 */
+					if (srv->check.rise == 1) {
+						srv->check.health = srv->check.rise + srv->check.fall - 1;
+						srv_set_running(srv, "", NULL);
+						break;
+					}
+					if (srv->check.health < 1 || srv->check.health >= srv->check.rise)
+						srv->check.health = srv->check.rise - 1;
 					srv->next_state = srv_op_state;
 					break;
 				case SRV_ST_STOPPING:
-					srv->check.health = srv->check.rise + srv->check.fall - 1;
+					/* If fall == 1 there is no STOPPING state, let's switch to
+					 * STOPPED
+					 */
+					if (srv->check.fall == 1) {
+						srv->check.health = 0;
+						srv_set_stopped(srv, "changed from server-state after a reload", NULL);
+						break;
+					}
+					if (srv->check.health < srv->check.rise ||
+					    srv->check.health > srv->check.rise + srv->check.fall - 2)
+						srv->check.health = srv->check.rise;
 					srv_set_stopping(srv, "changed from server-state after a reload", NULL);
 					break;
 				case SRV_ST_RUNNING:
@@ -3092,7 +3085,6 @@ static void srv_update_state(struct server *srv, int version, char **params)
 			srv->last_change = date.tv_sec - srv_last_time_change;
 			srv->check.status = srv_check_status;
 			srv->check.result = srv_check_result;
-			srv->check.health = srv_check_health;
 
 			/* Only case we want to apply is removing ENABLED flag which could have been
 			 * done by the "disable health" command over the stats socket
@@ -5313,11 +5305,11 @@ static void srv_update_status(struct server *s)
 	*s->adm_st_chg_cause = 0;
 }
 
-static struct task *cleanup_idle_connections(struct task *task, void *context, unsigned short state)
+struct task *srv_cleanup_idle_connections(struct task *task, void *context, unsigned short state)
 {
 	struct server *srv = context;
 	struct connection *conn, *conn_back;
-	unsigned int to_destroy = srv->curr_idle_conns / 2 + (srv->curr_idle_conns & 1);
+	unsigned int to_destroy = srv->curr_idle_thr[tid] / 2 + (srv->curr_idle_thr[tid] & 1);
 	unsigned int i = 0;
 
 

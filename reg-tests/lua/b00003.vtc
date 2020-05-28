@@ -14,6 +14,7 @@
 # connectio closed by the client may stop the applet.
 
 varnishtest "possible CLOSE-WAIT with '\n' headers"
+#REQUIRE_OPTIONS=LUA
 
 feature ignore_unknown_macro
 
@@ -29,12 +30,12 @@ haproxy h1 -conf {
 
     global
         lua-load ${testdir}/b00003.lua
-        nbthread 4
 
     frontend frt
         log ${Slog_addr}:${Slog_port} local0 debug err
         log-format Ta=%Ta\ Tc=%Tc\ Td=%Td\ Th=%Th\ Ti=%Ti\ Tq=%Tq\ TR=%TR\ Tr=%Tr\ Tt=%Tt\ Tw=%Tw
         mode http
+        ${no-htx} option http-use-htx
         bind "fd@${frt}"
         http-request use-service lua.donothing
 } -start

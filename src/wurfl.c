@@ -46,7 +46,7 @@ inline static void ha_wurfl_log(char * message, ...)
 	va_start(argp, message);
 	vsnprintf(logbuf, sizeof(logbuf), message, argp);
 	va_end(argp);
-	send_log(NULL, LOG_NOTICE, logbuf, NULL);
+	send_log(NULL, LOG_NOTICE, "%s", logbuf);
 }
 #else
 inline static void ha_wurfl_log(char * message, ...)
@@ -313,11 +313,6 @@ static int ha_wurfl_init(void)
 		ha_warning("WURFL: missing wurfl-data-file parameter in global configuration\n");
 		send_log(NULL, LOG_WARNING, "WURFL: missing wurfl-data-file parameter in global configuration\n");
 		return ERR_WARN;
-	}
-
-	if (global.nbthread > 1) {
-		ha_alert("WURFL: multithreading is not supported for now.\n");
-		return (ERR_FATAL | ERR_ALERT);
 	}
 
 	if (wurfl_set_root(global_wurfl.handle, global_wurfl.data_file) != WURFL_OK) {
@@ -607,9 +602,10 @@ static int ha_wurfl_get(const struct arg *args, struct sample *smp, const char *
 	while (args[i].data.str.area) {
 		chunk_appendf(temp, "%c", global_wurfl.information_list_separator);
 		node = ebst_lookup(&global_wurfl.btree, args[i].data.str.area);
-		wn = container_of(node, wurfl_data_t, nd);
 
-		if (wn) {
+		if (node) {
+
+			wn = container_of(node, wurfl_data_t, nd);
 
 			switch(wn->type) {
 			case HA_WURFL_DATA_TYPE_UNKNOWN :
@@ -783,7 +779,7 @@ static const char *ha_wurfl_retrieve_header(const char *header_name, const void 
 	msg = &smp->strm->txn->req;
 	ctx.idx = 0;
 
-	if (http_find_full_header2(header_name, strlen(header_name), msg->chn->buf->p, idx, &ctx) == 0)
+	if (http_find_full_header2(header_name, strlen(header_name), ci_head(msg->chn), idx, &ctx) == 0)
 		return 0;
 
 	if (header_len > ctx.vlen)

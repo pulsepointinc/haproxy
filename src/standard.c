@@ -935,7 +935,7 @@ struct sockaddr_storage *str2sa_range(const char *str, int *port, int *low, int 
 		 */
 		prefix_path_len = (pfx && !abstract) ? strlen(pfx) : 0;
 		max_path_len = (sizeof(((struct sockaddr_un *)&ss)->sun_path) - 1) -
-			(prefix_path_len ? prefix_path_len + 1 + 5 + 1 + 3 : 0);
+			(abstract ? 0 : prefix_path_len + 1 + 5 + 1 + 3);
 
 		adr_len = strlen(str2);
 		if (adr_len > max_path_len) {
@@ -2825,19 +2825,37 @@ char *date2str_log(char *dst, const struct tm *tm, const struct timeval *date, s
 		return NULL;
 
 	dst = utoa_pad((unsigned int)tm->tm_mday, dst, 3); // day
+	if (!dst)
+		return NULL;
 	*dst++ = '/';
+
 	memcpy(dst, monthname[tm->tm_mon], 3); // month
 	dst += 3;
 	*dst++ = '/';
+
 	dst = utoa_pad((unsigned int)tm->tm_year+1900, dst, 5); // year
+	if (!dst)
+		return NULL;
 	*dst++ = ':';
+
 	dst = utoa_pad((unsigned int)tm->tm_hour, dst, 3); // hour
+	if (!dst)
+		return NULL;
 	*dst++ = ':';
+
 	dst = utoa_pad((unsigned int)tm->tm_min, dst, 3); // minutes
+	if (!dst)
+		return NULL;
 	*dst++ = ':';
+
 	dst = utoa_pad((unsigned int)tm->tm_sec, dst, 3); // secondes
+	if (!dst)
+		return NULL;
 	*dst++ = '.';
+
 	utoa_pad((unsigned int)(date->tv_usec/1000), dst, 4); // millisecondes
+	if (!dst)
+		return NULL;
 	dst += 3;  // only the 3 first digits
 	*dst = '\0';
 
@@ -2901,11 +2919,12 @@ const char *get_gmt_offset(time_t t, struct tm *tm)
 		} else {
 			*gmt_offset = '+';
 		}
+		diff %= 86400U;
 		diff /= 60; /* Convert to minutes */
 		snprintf(gmt_offset+1, 4+1, "%02d%02d", diff/60, diff%60);
 	}
 
-    return gmt_offset;
+	return gmt_offset;
 }
 
 /* gmt2str_log: write a date in the format :
@@ -2919,17 +2938,32 @@ char *gmt2str_log(char *dst, struct tm *tm, size_t size)
 		return NULL;
 
 	dst = utoa_pad((unsigned int)tm->tm_mday, dst, 3); // day
+	if (!dst)
+		return NULL;
 	*dst++ = '/';
+
 	memcpy(dst, monthname[tm->tm_mon], 3); // month
 	dst += 3;
 	*dst++ = '/';
+
 	dst = utoa_pad((unsigned int)tm->tm_year+1900, dst, 5); // year
+	if (!dst)
+		return NULL;
 	*dst++ = ':';
+
 	dst = utoa_pad((unsigned int)tm->tm_hour, dst, 3); // hour
+	if (!dst)
+		return NULL;
 	*dst++ = ':';
+
 	dst = utoa_pad((unsigned int)tm->tm_min, dst, 3); // minutes
+	if (!dst)
+		return NULL;
 	*dst++ = ':';
+
 	dst = utoa_pad((unsigned int)tm->tm_sec, dst, 3); // secondes
+	if (!dst)
+		return NULL;
 	*dst++ = ' ';
 	*dst++ = '+';
 	*dst++ = '0';
@@ -2956,18 +2990,34 @@ char *localdate2str_log(char *dst, time_t t, struct tm *tm, size_t size)
 	gmt_offset = get_gmt_offset(t, tm);
 
 	dst = utoa_pad((unsigned int)tm->tm_mday, dst, 3); // day
+	if (!dst)
+		return NULL;
 	*dst++ = '/';
+
 	memcpy(dst, monthname[tm->tm_mon], 3); // month
 	dst += 3;
 	*dst++ = '/';
+
 	dst = utoa_pad((unsigned int)tm->tm_year+1900, dst, 5); // year
+	if (!dst)
+		return NULL;
 	*dst++ = ':';
+
 	dst = utoa_pad((unsigned int)tm->tm_hour, dst, 3); // hour
+	if (!dst)
+		return NULL;
 	*dst++ = ':';
+
 	dst = utoa_pad((unsigned int)tm->tm_min, dst, 3); // minutes
+	if (!dst)
+		return NULL;
 	*dst++ = ':';
+
 	dst = utoa_pad((unsigned int)tm->tm_sec, dst, 3); // secondes
+	if (!dst)
+		return NULL;
 	*dst++ = ' ';
+
 	memcpy(dst, gmt_offset, 5); // Offset from local time to GMT
 	dst += 5;
 	*dst = '\0';
@@ -3439,12 +3489,14 @@ char *memvprintf(char **out, const char *format, va_list orig_args)
 		return NULL;
 
 	do {
+		char buf1;
+
 		/* vsnprintf() will return the required length even when the
 		 * target buffer is NULL. We do this in a loop just in case
 		 * intermediate evaluations get wrong.
 		 */
 		va_copy(args, orig_args);
-		needed = vsnprintf(ret, allocated, format, args);
+		needed = vsnprintf(ret ? ret : &buf1, allocated, format, args);
 		va_end(args);
 		if (needed < allocated) {
 			/* Note: on Solaris 8, the first iteration always
@@ -4010,7 +4062,9 @@ void debug_hexdump(FILE *out, const char *pfx, const char *buf,
 }
 
 /* do nothing, just a placeholder for debugging calls, the real one is in trace.c */
+#ifndef USE_OBSOLETE_LINKER
 __attribute__((weak,format(printf, 1, 2)))
+#endif
 void trace(char *msg, ...)
 {
 }

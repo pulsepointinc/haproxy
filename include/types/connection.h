@@ -87,7 +87,10 @@ enum {
 	CS_FL_ERR_PENDING   = 0x00000800,  /* An error is pending, but there's still data to be read */
 	CS_FL_EOS           = 0x00001000,  /* End of stream delivered to data layer */
 	CS_FL_REOS          = 0x00002000,  /* End of stream received (buffer not empty) */
+	CS_FL_EOI           = 0x00004000,  /* end-of-input reached */
+	/* unused: 0x00008000 */
 	CS_FL_WAIT_FOR_HS   = 0x00010000,  /* This stream is waiting for handhskae */
+	CS_FL_KILL_CONN     = 0x00020000,  /* must kill the connection when the CS closes */
 
 	/* following flags are supposed to be set by the mux and read/unset by
 	 * the stream-interface :
@@ -196,6 +199,8 @@ enum {
 	/* This flag is used to know that a PROXY protocol header was sent by the client */
 	CO_FL_RCVD_PROXY    = 0x20000000,
 
+	/* The connection is unused by its owner */
+	CO_FL_SESS_IDLE     = 0x40000000,
 	/* unused : 0x40000000 */
 
 	/* This last flag indicates that the transport layer is used (for instance
@@ -316,6 +321,12 @@ struct xprt_ops {
 	int (*unsubscribe)(struct connection *conn, int event_type, void *param); /* Unsubscribe to events */
 };
 
+enum mux_ctl_type {
+	MUX_STATUS, /* Expects an int as output, sets it to a combinaison of MUX_STATUS flags */
+};
+
+#define MUX_STATUS_READY (1 << 0)
+
 /* mux_ops describes the mux operations, which are to be performed at the
  * connection level after data are exchanged with the transport layer in order
  * to propagate them to streams. The <init> function will automatically be
@@ -340,10 +351,11 @@ struct mux_ops {
 	int (*subscribe)(struct conn_stream *cs, int event_type, void *param); /* Subscribe to events, such as "being able to send" */
 	int (*unsubscribe)(struct conn_stream *cs, int event_type, void *param); /* Unsubscribe to events */
 	int (*avail_streams)(struct connection *conn); /* Returns the number of streams still available for a connection */
-	int (*max_streams)(struct connection *conn);   /* Returns the max number of streams available for that connection. */
+	int (*used_streams)(struct connection *conn);  /* Returns the number of streams in use on a connection. */
 	void (*destroy)(struct connection *conn); /* Let the mux know one of its users left, so it may have to disappear */
 	void (*reset)(struct connection *conn); /* Reset the mux, because we're re-trying to connect */
 	const struct cs_info *(*get_cs_info)(struct conn_stream *cs); /* Return info on the specified conn_stream or NULL if not defined */
+	int (*ctl)(struct connection *conn, enum mux_ctl_type mux_ctl, void *arg); /* Provides informations about the mux */
 	unsigned int flags;                           /* some flags characterizing the mux's capabilities (MX_FL_*) */
 	char name[8];                                 /* mux layer name, zero-terminated */
 };
@@ -542,6 +554,7 @@ struct proxy_hdr_v2 {
 #define PP2_TYPE_AUTHORITY      0x02
 #define PP2_TYPE_CRC32C         0x03
 #define PP2_TYPE_NOOP           0x04
+#define PP2_TYPE_UNIQUE_ID      0x05
 #define PP2_TYPE_SSL            0x20
 #define PP2_SUBTYPE_SSL_VERSION 0x21
 #define PP2_SUBTYPE_SSL_CN      0x22

@@ -47,7 +47,7 @@
 struct list dns_resolvers  = LIST_HEAD_INIT(dns_resolvers);
 struct list dns_srvrq_list = LIST_HEAD_INIT(dns_srvrq_list);
 
-static THREAD_LOCAL int64_t dns_query_id_seed = 0; /* random seed */
+static THREAD_LOCAL uint64_t dns_query_id_seed = 0; /* random seed */
 
 DECLARE_STATIC_POOL(dns_answer_item_pool, "dns_answer_item", sizeof(struct dns_answer_item));
 DECLARE_STATIC_POOL(dns_resolution_pool,  "dns_resolution",  sizeof(struct dns_resolution));
@@ -141,10 +141,7 @@ static inline uint16_t dns_rnd16(void)
 
 static inline int dns_resolution_timeout(struct dns_resolution *res)
 {
-	switch (res->status) {
-		case RSLV_STATUS_VALID: return res->resolvers->hold.valid;
-		default:                return res->resolvers->timeout.resolve;
-	}
+	return res->resolvers->timeout.resolve;
 }
 
 /* Updates a resolvers' task timeout for next wake up and queue it */
@@ -417,7 +414,7 @@ int dns_read_name(unsigned char *buffer, unsigned char *bufend,
 			if (depth++ > 100)
 				goto err;
 
-			n = dns_read_name(buffer, bufend, buffer + reader[1],
+			n = dns_read_name(buffer, bufend, buffer + (*reader & 0x3f)*256 + reader[1],
 					  dest, dest_len - nb_bytes, offset, depth);
 			if (n == 0)
 				goto err;
@@ -534,10 +531,12 @@ static void dns_check_dns_response(struct dns_resolution *res)
 				    !memcmp(srv->hostname_dn, item->target, item->data_len)) {
 					int ha_weight;
 
-					/* Make sure weight is at least 1, so
-					 * that the server will be used.
+					/* DNS weight range if from 0 to 65535
+					 * HAProxy weight is from 0 to 256
+					 * The rule below ensures that weight 0 is well respected
+					 * while allowing a "mapping" from DNS weight into HAProxy's one.
 					 */
-					ha_weight = item->weight / 256 + 1;
+					ha_weight = (item->weight + 255) / 256;
 					if (srv->uweight != ha_weight) {
 						char weight[9];
 
@@ -581,10 +580,12 @@ static void dns_check_dns_response(struct dns_resolution *res)
 				    !(srv->flags & SRV_F_CHECKPORT))
 					srv->check.port = item->port;
 
-				/* Make sure weight is at least 1, so
-				 * that the server will be used.
+				/* DNS weight range if from 0 to 65535
+				 * HAProxy weight is from 0 to 256
+				 * The rule below ensures that weight 0 is well respected
+				 * while allowing a "mapping" from DNS weight into HAProxy's one.
 				 */
-				ha_weight = item->weight / 256 + 1;
+				ha_weight = (item->weight + 255) / 256;
 
 				snprintf(weight, sizeof(weight), "%d", ha_weight);
 				server_parse_weight_change_request(srv, weight);
@@ -810,7 +811,7 @@ static int dns_validate_dns_response(unsigned char *resp, unsigned char *bufend,
 		/* Move forward 2 bytes for data len */
 		reader += 2;
 
-		if (reader + dns_answer_record->data_len >= bufend) {
+		if (reader + dns_answer_record->data_len > bufend) {
 			pool_free(dns_answer_item_pool, dns_answer_record);
 			return DNS_RESP_INVALID;
 		}
@@ -1195,6 +1196,12 @@ int dns_str_to_dn_label(const char *str, int str_len, char *dn, int dn_len)
 			if (i == offset)
 				return -1;
 
+			/* ignore trailing dot */
+			if (i + 2 == str_len) {
+				i++;
+				break;
+			}
+
 			dn[offset] = (i - offset);
 			offset = i+1;
 			continue;
@@ -1215,7 +1222,6 @@ int dns_str_to_dn_label(const char *str, int str_len, char *dn, int dn_len)
  */
 int dns_hostname_validation(const char *string, char **err)
 {
-	const char *c, *d;
 	int i;
 
 	if (strlen(string) > DNS_MAX_NAME_SIZE) {
@@ -1224,36 +1230,32 @@ int dns_hostname_validation(const char *string, char **err)
 		return 0;
 	}
 
-	c = string;
-	while (*c) {
-		d = c;
-
+	while (*string) {
 		i = 0;
-		while (*d != '.' && *d && i <= DNS_MAX_LABEL_SIZE) {
-			i++;
-			if (!((*d == '-') || (*d == '_') ||
-			      ((*d >= 'a') && (*d <= 'z')) ||
-			      ((*d >= 'A') && (*d <= 'Z')) ||
-			      ((*d >= '0') && (*d <= '9')))) {
+		while (*string && *string != '.' && i < DNS_MAX_LABEL_SIZE) {
+			if (!(*string == '-' || *string == '_' ||
+			      (*string >= 'a' && *string <= 'z') ||
+			      (*string >= 'A' && *string <= 'Z') ||
+			      (*string >= '0' && *string <= '9'))) {
 				if (err)
 					*err = DNS_INVALID_CHARACTER;
 				return 0;
 			}
-			d++;
+			i++;
+			string++;
 		}
 
-		if ((i >= DNS_MAX_LABEL_SIZE) && (d[i] != '.')) {
+		if (!(*string))
+			break;
+
+		if (*string != '.' && i >= DNS_MAX_LABEL_SIZE) {
 			if (err)
 				*err = DNS_LABEL_TOO_LONG;
 			return 0;
 		}
 
-		if (*d == '\0')
-			goto out;
-
-		c = ++d;
+		string++;
 	}
- out:
 	return 1;
 }
 
@@ -1493,18 +1495,25 @@ static void dns_resolve_recv(struct dgram_conn *dgram)
 		return;
 
 	/* no need to go further if we can't retrieve the nameserver */
-	if ((ns = dgram->owner) == NULL)
+	if ((ns = dgram->owner) == NULL) {
+		HA_ATOMIC_AND(&fdtab[fd].ev, ~(FD_POLL_HUP|FD_POLL_ERR));
+		fd_stop_recv(fd);
 		return;
+	}
 
 	resolvers = ns->resolvers;
 	HA_SPIN_LOCK(DNS_LOCK, &resolvers->lock);
 
 	/* process all pending input messages */
-	while (1) {
+	while (fd_recv_ready(fd)) {
 		/* read message received */
 		memset(buf, '\0', resolvers->accepted_payload_size + 1);
 		if ((buflen = recv(fd, (char*)buf , resolvers->accepted_payload_size + 1, 0)) < 0) {
-			/* FIXME : for now we consider EAGAIN only */
+			/* FIXME : for now we consider EAGAIN only, but at
+			 * least we purge sticky errors that would cause us to
+			 * be called in loops.
+			 */
+			HA_ATOMIC_AND(&fdtab[fd].ev, ~(FD_POLL_HUP|FD_POLL_ERR));
 			fd_cant_recv(fd);
 			break;
 		}

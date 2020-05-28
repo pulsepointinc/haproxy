@@ -84,8 +84,13 @@ static inline void chash_queue_dequeue_srv(struct server *s)
 	 * increased the weight beyond the original weight
 	 */
 	if (s->lb_nodes_tot < s->next_eweight) {
-		struct tree_occ *new_nodes = realloc(s->lb_nodes, s->next_eweight);
+		struct tree_occ *new_nodes;
 
+		/* First we need to remove all server's entries from its tree
+		 * because the realloc will change all nodes pointers */
+		chash_dequeue_srv(s);
+
+		new_nodes = realloc(s->lb_nodes, s->next_eweight * sizeof(*new_nodes));
 		if (new_nodes) {
 			unsigned int j;
 
@@ -290,7 +295,7 @@ int chash_server_is_eligible(struct server *s)
 	/* The total number of slots to allocate is the total number of outstanding requests
 	 * (including the one we're about to make) times the load-balance-factor, rounded up.
 	 */
-	unsigned tot_slots = ((s->proxy->served + 1) * s->proxy->lbprm.chash.balance_factor + 99) / 100;
+	unsigned tot_slots = ((s->proxy->served + 1) * s->proxy->lbprm.hash_balance_factor + 99) / 100;
 	unsigned slots_per_weight = tot_slots / s->proxy->lbprm.tot_weight;
 	unsigned remainder = tot_slots % s->proxy->lbprm.tot_weight;
 
@@ -313,9 +318,10 @@ int chash_server_is_eligible(struct server *s)
  * the closest distance from the value of <hash>. Doing so ensures that even
  * with a well imbalanced hash, if some servers are close to each other, they
  * will still both receive traffic. If any server is found, it will be returned.
+ * It will also skip server <avoid> if the hash result ends on this one.
  * If no valid server is found, NULL is returned.
  */
-struct server *chash_get_server_hash(struct proxy *p, unsigned int hash)
+struct server *chash_get_server_hash(struct proxy *p, unsigned int hash, const struct server *avoid)
 {
 	struct eb32_node *next, *prev;
 	struct server *nsrv, *psrv;
@@ -367,7 +373,7 @@ struct server *chash_get_server_hash(struct proxy *p, unsigned int hash)
 	}
 
 	loop = 0;
-	while (p->lbprm.chash.balance_factor && !chash_server_is_eligible(nsrv)) {
+	while (nsrv == avoid || (p->lbprm.hash_balance_factor && !chash_server_is_eligible(nsrv))) {
 		next = eb32_next(next);
 		if (!next) {
 			next = eb32_first(root);
@@ -493,7 +499,6 @@ void chash_init_server_tree(struct proxy *p)
 		srv->lb_nodes_tot = srv->uweight * BE_WEIGHT_SCALE;
 		srv->lb_nodes_now = 0;
 		srv->lb_nodes = calloc(srv->lb_nodes_tot, sizeof(struct tree_occ));
-
 		for (node = 0; node < srv->lb_nodes_tot; node++) {
 			srv->lb_nodes[node].server = srv;
 			srv->lb_nodes[node].node.key = full_hash(srv->puid * SRV_EWGHT_RANGE + node);
