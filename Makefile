@@ -468,17 +468,18 @@ endif
 
 #### Determine version, sub-version and release date.
 # If GIT is found, and IGNOREGIT is not set, VERSION, SUBVERS and VERDATE are
-# extracted from the last commit. Otherwise, use the contents of the files
+# extracted from the branch and last commit. Otherwise, use the contents of the files
 # holding the same names in the current directory.
 
 ifeq ($(IGNOREGIT),)
-VERSION := $(shell [ -d .git/. ] && (git describe --tags --match 'v*' --abbrev=0 | cut -c 2-) 2>/dev/null)
+VERSION := $(shell [ -d .git/. ] && (git rev-parse --abbrev-ref HEAD) 2>/dev/null)
 ifneq ($(VERSION),)
 # OK git is there and works.
-SUBVERS := $(shell comms=`git log --format=oneline --no-merges v$(VERSION).. 2>/dev/null | wc -l | tr -d '[:space:]'`; commit=`(git log -1 --pretty=%h --abbrev=6) 2>/dev/null`; [ $$comms -gt 0 ] && echo "-$$commit-$$comms")
 VERDATE := $(shell git log -1 --pretty=format:%ci | cut -f1 -d' ' | tr '-' '/')
 endif
 endif
+
+DOCKER_REGISTRY?=registry.pulsepoint.com/
 
 # Last commit version not found, take it from the files.
 ifeq ($(VERSION),)
@@ -1062,6 +1063,7 @@ clean:
 	$(Q)for dir in . src include/* doc ebtree; do rm -f $$dir/*~ $$dir/*.rej $$dir/core; done
 	$(Q)rm -f haproxy-$(VERSION).tar.gz haproxy-$(VERSION)$(SUBVERS).tar.gz
 	$(Q)rm -f haproxy-$(VERSION) haproxy-$(VERSION)$(SUBVERS) nohup.out gmon.out
+	$(Q)rm -f docker/haproxy-$(VERSION)$(SUBVERS).tar.gz
 
 tags:
 	$(Q)find src include \( -name '*.c' -o -name '*.h' \) -print0 | \
@@ -1154,3 +1156,8 @@ reg-tests-help:
 	@echo "    LEVEL 6 scripts are experimental, typically used to develop new scripts (prefixed with 'e' lettre)."
 
 .PHONY: reg-tests reg-tests-help
+
+docker-build:	tar
+	@echo Starting haproxy container image build.
+	mv haproxy-$(VERSION)$(SUBVERS).tar.gz docker/haproxy.tar.gz
+	docker build -t $(DOCKER_REGISTRY)haproxy:"$(VERSION)" docker

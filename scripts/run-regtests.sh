@@ -327,7 +327,7 @@ fi
 $($HAPROXY_PROGRAM -vv |grep 'HA-Proxy version\|TARGET\|OPTIONS' | sed 's/.* = //')
 EOF
 
-HAPROXY_VERSION=$(echo $HAPROXY_VERSION | cut -d " " -f 3)
+HAPROXY_VERSION=$(echo $HAPROXY_VERSION | cut -d " " -f 3 | grep -oE "[0-9]\.[0-9]")
 echo "Testing with haproxy version: $HAPROXY_VERSION"
 
 TESTRUNDATETIME="$(date '+%Y-%m-%d_%H-%M-%S')"

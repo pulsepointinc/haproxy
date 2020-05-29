@@ -5093,6 +5093,9 @@ int http_process_res_common(struct stream *s, struct channel *rep, int an_bit, s
 		if (s->be->ck_opts & PR_CK_SECURE)
 			chunk_appendf(&trash, "; Secure");
 
+		if (s->be->cookie_samesite)
+			chunk_appendf(&trash, "; SameSite=%s", s->be->cookie_samesite);
+
 		if (s->be->cookie_attrs)
 			chunk_appendf(&trash, "; %s", s->be->cookie_attrs);
 

@@ -1124,6 +1124,34 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 					err_code |= ERR_WARN;
 				curproxy->ck_opts |= PR_CK_DYNAMIC;
 			}
+			else if (!strcmp(args[cur_arg], "samesite")) {
+				const char *ss;
+
+				if (!*args[cur_arg + 1]) {
+					ha_alert("parsing [%s:%d]: '%s' expects <samesite-value> as argument.\n",
+						file, linenum, args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
+				ss = args[cur_arg + 1];
+
+				if (!strcmp(ss, "none")) {
+					curproxy->cookie_samesite = "None";
+					curproxy->ck_opts |= PR_CK_SECURE;
+				} else if (!strcmp(ss, "lax")) {
+					curproxy->cookie_samesite = "Lax";
+				} else if (!strcmp(ss, "strict")) {
+					curproxy->cookie_samesite = "Strict";
+				} else {
+					ha_alert("parsing [%s:%d]: '%s' supports 'none', 'lax' and 'strict' as argument.\n",
+						file, linenum, ss);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
+				cur_arg++;
+			}
 			else if (!strcmp(args[cur_arg], "attr")) {
 				char *val;
 				if (!*args[cur_arg + 1]) {
