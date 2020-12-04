@@ -25,6 +25,7 @@
 !/scripts
 !/reg-tests
 !/docker
+!/ppfp
 # Reject some generic files
 *.o
 *~

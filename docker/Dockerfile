@@ -1,7 +1,7 @@
 # vim:set ft=dockerfile:
 FROM debian:buster-slim
 
-ENV HAPROXY_VERSION 1.9_pp
+ENV HAPROXY_VERSION 1.9_pp_fp
 COPY haproxy.tar.gz /tmp
 
 # see https://sources.debian.net/src/haproxy/jessie/debian/rules/ for some helpful navigation of the possible "make" arguments
@@ -18,11 +18,16 @@ RUN set -x \
 		make \
 		wget \
 		zlib1g-dev \
+		libpcap-dev \
 	&& rm -rf /var/lib/apt/lists/* \
 	\
 	&& mkdir -p /usr/src/haproxy \
 	&& tar -xzf /tmp/haproxy.tar.gz -C /usr/src/haproxy --strip-components=1 \
 	&& rm /tmp/haproxy.tar.gz \
+	\
+	&& eval "make -C /usr/src/haproxy/ppfp clean package CC=gcc" \
+	&& eval "cp /usr/src/haproxy/ppfp/src/fplib/fplib.h /usr/include" \
+	&& eval "cp /usr/src/haproxy/ppfp/target/libfingerprint.so /usr/lib/x86_64-linux-gnu" \
 	\
 	&& makeOpts=' \
 		TARGET=linux2628 \
@@ -31,6 +36,7 @@ RUN set -x \
 		USE_OPENSSL=1 \
 		USE_PCRE2=1 USE_PCRE2_JIT=1 \
 		USE_ZLIB=1 \
+		USE_PPFP=1 \
 		\
 		EXTRA_OBJS=" \
 		" \

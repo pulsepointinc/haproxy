@@ -1,0 +1,3 @@
+[submodule "ppfp"]
+	path = ppfp
+	url = git@github.com:pulsepointinc/c-fp.git
