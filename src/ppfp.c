@@ -1,22 +1,10 @@
-#include <stdio.h>
-#include <sys/types.h>
-#include <stdint.h>
-
-#include <stdlib.h>
-#include <string.h>
-
-#include <netinet/in.h>
-#include "common/mini-clist.h"
-#include "types/arg.h"
-#include "types/session.h"
-#include "proto/arg.h"
-#include "proto/obj_type.h"
-
-#include <common/errors.h>   // for init ERR_* returns
-#include <common/cfgparse.h> // for config_keywords
-
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <common/cfgparse.h>
 #include <proto/sample.h>
 #include <openssl/ssl.h>
+#include "proto/arg.h"
+#include "proto/obj_type.h"
 #include "fplib.h"
 
 /**
@@ -46,6 +34,9 @@
  * @brief global configuration; updated via configuration
  */
 FP_LIB_CONFIG fplib_cfg;
+
+int tls_listen_port;
+
 /**
  * @brief global libfingerprint handle
  */
@@ -144,6 +135,73 @@ static int _ppfp_write_binhex_or_error(char **args, char **err, int min_bytes, i
     {
         *opt_size = copied;
     }
+    return 0;
+}
+
+/**
+ * @brief populates the IP address (e.g. 1.2.3.4) of an interface into dest
+ * @param dest destination ip string pointer (e.g. 1.2.3.4)
+ * @param interface_name interface name string (e.g. eth0)
+ * 
+ * @return 0 on success
+ */
+static int _get_ipv4_addr(char *dest, char *interface_name)
+{
+    struct ifreq ifr;
+    int fd = 0;
+    size_t if_name_len = strlen(interface_name);
+    if (if_name_len < sizeof(ifr.ifr_name))
+    {
+        memcpy(ifr.ifr_name, interface_name, if_name_len);
+        ifr.ifr_name[if_name_len] = 0;
+    }
+    else
+    {
+        // interface name too long
+        return -1;
+    }
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd == -1)
+    {
+        return -2;
+    }
+    if (ioctl(fd, SIOCGIFADDR, &ifr) == -1)
+    {
+        close(fd);
+        return -3;
+    }
+    close(fd);
+    strcpy(dest, inet_ntoa(((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr));
+    return 0;
+}
+
+/**
+ * @brief configures the capture string stored in fplib_cfg.cap_config.cap_bpf_filter by looking at device and port configs
+ * @return 0 on success
+ */
+static int _configure_capstring()
+{
+    int errcode = 0;
+    char cap_bpf_filter[1024];
+    char cap_dst_ipv4[16];
+    bzero(cap_dst_ipv4, 1024);
+    bzero(cap_bpf_filter, 16);
+
+    if ((errcode = _get_ipv4_addr(cap_dst_ipv4, fplib_cfg.cap_config.cap_device_name)) != 0)
+    {
+        return -1;
+    }
+
+    if (snprintf(cap_bpf_filter, 1024, "tcp dst port %d and dst host %s and ((tcp[tcpflags] & (tcp-syn) != 0) or ((tcp[tcp[12]/16*4]=22 and (tcp[tcp[12]/16*4+5]=1) and (tcp[tcp[12]/16*4+9]=3) and (tcp[tcp[12]/16*4+1]=3)) or (ip6[(ip6[52]/16*4)+40]=22 and (ip6[(ip6[52]/16*4+5)+40]=1) and (ip6[(ip6[52]/16*4+9)+40]=3) and (ip6[(ip6[52]/16*4+1)+40]=3)) or ((udp[14] = 6 and udp[16] = 32 and udp[17] = 1) and ((udp[(udp[60]/16*4)+48]=22) and (udp[(udp[60]/16*4)+53]=1) and (udp[(udp[60]/16*4)+57]=3) and (udp[(udp[60]/16*4)+49]=3))) or (proto 41 and ip[26] = 6 and ip[(ip[72]/16*4)+60]=22 and (ip[(ip[72]/16*4+5)+60]=1) and (ip[(ip[72]/16*4+9)+60]=3) and (ip[(ip[72]/16*4+1)+60]=3))))", tls_listen_port, cap_dst_ipv4) <= 0)
+    {
+        return -2;
+    }
+
+    if (fplib_cfg.cap_config.cap_bpf_filter)
+    {
+        free(fplib_cfg.cap_config.cap_bpf_filter);
+    }
+    fplib_cfg.cap_config.cap_bpf_filter = strdup(cap_bpf_filter);
     return 0;
 }
 
@@ -260,6 +318,12 @@ static int init_ppfp(void)
         return 0;
     }
 
+    if ((errcode = _configure_capstring()) != 0)
+    {
+        ha_alert("PPFP: Unable to configure PPFP capture; errcode %d", errcode);
+        return ERR_ALERT | ERR_FATAL;
+    }
+
     // attempt to figure out the SSL exdata index used to store connections by haproxy by
     // creating a dummy index and subtracting 2 (because haproxy uses two index slots)
     // note that later versions of haproxy seem to just rely on connections stored in SSL_BIOs
@@ -271,8 +335,7 @@ static int init_ppfp(void)
 
     // create new handle
     FP_LIB_HANDLE_free(fph);
-    errcode = FP_LIB_HANDLE_new(&fplib_cfg, &fph, errmsg);
-    if (errcode != 0)
+    if ((errcode = FP_LIB_HANDLE_new(&fplib_cfg, &fph, errmsg)) != 0)
     {
         ha_alert("PPFP: FP_LIB_HANDLE_new failed with code %d: %s", errcode, errmsg);
         return ERR_ALERT | ERR_FATAL;
@@ -344,25 +407,7 @@ static int _ppfp_set_tls_port(char **args, int section_type, struct proxy *curpx
                               struct proxy *defpx, const char *file, int line,
                               char **err)
 {
-
-    char cap_bpf_filter[1024];
-    int port_number;
-    if (_ppfp_write_int_or_error(args, err, 0, 65536, &port_number) < 0)
-    {
-        return -1;
-    }
-
-    if (snprintf(cap_bpf_filter, 1024, "tcp dst port %d and ((tcp[tcpflags] & (tcp-syn) != 0) or ((tcp[tcp[12]/16*4]=22 and (tcp[tcp[12]/16*4+5]=1) and (tcp[tcp[12]/16*4+9]=3) and (tcp[tcp[12]/16*4+1]=3)) or (ip6[(ip6[52]/16*4)+40]=22 and (ip6[(ip6[52]/16*4+5)+40]=1) and (ip6[(ip6[52]/16*4+9)+40]=3) and (ip6[(ip6[52]/16*4+1)+40]=3)) or ((udp[14] = 6 and udp[16] = 32 and udp[17] = 1) and ((udp[(udp[60]/16*4)+48]=22) and (udp[(udp[60]/16*4)+53]=1) and (udp[(udp[60]/16*4)+57]=3) and (udp[(udp[60]/16*4)+49]=3))) or (proto 41 and ip[26] = 6 and ip[(ip[72]/16*4)+60]=22 and (ip[(ip[72]/16*4+5)+60]=1) and (ip[(ip[72]/16*4+9)+60]=3) and (ip[(ip[72]/16*4+1)+60]=3))))", port_number) <= 0)
-    {
-        memprintf(err, "could not construct capture string for port %d", port_number);
-    }
-
-    if (fplib_cfg.cap_config.cap_bpf_filter)
-    {
-        free(fplib_cfg.cap_config.cap_bpf_filter);
-    }
-    fplib_cfg.cap_config.cap_bpf_filter = strdup(cap_bpf_filter);
-    return 0;
+    return _ppfp_write_int_or_error(args, err, 0, 65536, &tls_listen_port);
 }
 
 static int _ppfp_set_aes_key(char **args, int section_type, struct proxy *curpx,
