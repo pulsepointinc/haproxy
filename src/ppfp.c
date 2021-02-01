@@ -19,6 +19,8 @@
  *   ppfp-tls-num-tickets            3
  *   ppfp-cap-ring-size              2048
  *   ppfp-cap-pkt-max-size           2048
+ *   ppfp-syn-map-bucket-size        32
+ *   ppfp-syn-map-bucket-count       1024
  *   ppfp-tls-map-bucket-size        32
  *   ppfp-tls-map-bucket-count       1024
  *   ppfp-tls-session-timeout-sec    14515200
@@ -452,6 +454,22 @@ static int _ppfp_set_cap_pkt_max_size(char **args, int section_type, struct prox
     return _ppfp_write_u_int16_t_or_error(args, err, 0, 65536, &fplib_cfg.cap_config.cap_max_packet_size);
 }
 
+
+static int _ppfp_set_syn_map_bucket_size(char **args, int section_type, struct proxy *curpx,
+                                         struct proxy *defpx, const char *file, int line,
+                                         char **err)
+{
+    return _ppfp_write_int_or_error(args, err, 1, 65536, &fplib_cfg.cap_config.syn_map_bucket_size);
+}
+
+static int _ppfp_set_syn_map_bucket_count(char **args, int section_type, struct proxy *curpx,
+                                          struct proxy *defpx, const char *file, int line,
+                                          char **err)
+{
+    return _ppfp_write_int_or_error(args, err, 1, 65536, &fplib_cfg.cap_config.syn_map_bucket_count);
+}
+
+
 static int _ppfp_set_tls_map_bucket_size(char **args, int section_type, struct proxy *curpx,
                                          struct proxy *defpx, const char *file, int line,
                                          char **err)
@@ -500,6 +518,8 @@ static struct cfg_kw_list _ppfp_kws =
          {CFG_GLOBAL, "ppfp-tls-num-tickets", _ppfp_set_num_tickets},
          {CFG_GLOBAL, "ppfp-cap-ring-size", _ppfp_set_cap_ring_size},
          {CFG_GLOBAL, "ppfp-cap-pkt-max-size", _ppfp_set_cap_pkt_max_size},
+         {CFG_GLOBAL, "ppfp-syn-map-bucket-size", _ppfp_set_syn_map_bucket_size},
+         {CFG_GLOBAL, "ppfp-syn-map-bucket-count", _ppfp_set_syn_map_bucket_count},
          {CFG_GLOBAL, "ppfp-tls-map-bucket-size", _ppfp_set_tls_map_bucket_size},
          {CFG_GLOBAL, "ppfp-tls-map-bucket-count", _ppfp_set_tls_map_bucket_count},
          {CFG_GLOBAL, "ppfp-tls-session-timeout-sec", _ppfp_set_tls_session_timeout},
