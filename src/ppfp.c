@@ -452,7 +452,7 @@ static int _ppfp_set_cap_ring_size(char **args, int section_type, struct proxy *
                                    struct proxy *defpx, const char *file, int line,
                                    char **err)
 {
-    return _ppfp_write_u_int16_t_or_error(args, err, 1024, 65536, &fplib_cfg.cap_config.cap_ring_buffer_size);
+    return _ppfp_write_u_int16_t_or_error(args, err, 8, 65536, &fplib_cfg.cap_config.cap_ring_buffer_size);
 }
 
 static int _ppfp_set_cap_pkt_max_size(char **args, int section_type, struct proxy *curpx,
