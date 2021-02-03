@@ -307,6 +307,14 @@ static int _fetch_fn(const struct arg *args, struct sample *smp, const char *kw,
 }
 
 /**
+ * @brief initializes ppfp config that may be reused later
+ */
+static int init_ppfp_config(void)
+{
+    return FP_LIB_CONFIG_init(&fplib_cfg);
+}
+
+/**
  * @brief module init function. Returns 0 if OK, or a combination of ERR_*.
  */
 static int init_ppfp(void)
@@ -454,7 +462,6 @@ static int _ppfp_set_cap_pkt_max_size(char **args, int section_type, struct prox
     return _ppfp_write_u_int16_t_or_error(args, err, 0, 65536, &fplib_cfg.cap_config.cap_max_packet_size);
 }
 
-
 static int _ppfp_set_syn_map_bucket_size(char **args, int section_type, struct proxy *curpx,
                                          struct proxy *defpx, const char *file, int line,
                                          char **err)
@@ -468,7 +475,6 @@ static int _ppfp_set_syn_map_bucket_count(char **args, int section_type, struct 
 {
     return _ppfp_write_int_or_error(args, err, 1, 65536, &fplib_cfg.cap_config.syn_map_bucket_count);
 }
-
 
 static int _ppfp_set_tls_map_bucket_size(char **args, int section_type, struct proxy *curpx,
                                          struct proxy *defpx, const char *file, int line,
@@ -526,6 +532,7 @@ static struct cfg_kw_list _ppfp_kws =
          {0, NULL, NULL},
      }};
 
+INITCALL0(STG_REGISTER, init_ppfp_config);
 INITCALL1(STG_REGISTER, cfg_register_keywords, &_ppfp_kws);
 INITCALL1(STG_REGISTER, sample_register_fetches, &fetch_keywords);
 REGISTER_POST_CHECK(init_ppfp);
