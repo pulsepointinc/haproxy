@@ -19,6 +19,7 @@
  *   ppfp-tls-num-tickets            3
  *   ppfp-cap-ring-size              2048
  *   ppfp-cap-pkt-max-size           2048
+ *   ppfp-cap-max-locktime-ms        500
  *   ppfp-syn-map-bucket-size        32
  *   ppfp-syn-map-bucket-count       1024
  *   ppfp-tls-map-bucket-size        32
@@ -107,6 +108,18 @@ static int _ppfp_write_int_or_error(char **args, char **err, int min_value, int 
 }
 
 static int _ppfp_write_u_int16_t_or_error(char **args, char **err, int min_value, int max_value, u_int16_t *dest)
+{
+    int int_value = 0;
+    int retval = _ppfp_write_int_or_error(args, err, min_value, max_value, &int_value);
+    if (retval < 0)
+    {
+        return retval;
+    }
+    *dest = int_value;
+    return retval;
+}
+
+static int _ppfp_write_u_int32_t_or_error(char **args, char **err, int min_value, int max_value, u_int32_t *dest)
 {
     int int_value = 0;
     int retval = _ppfp_write_int_or_error(args, err, min_value, max_value, &int_value);
@@ -291,6 +304,10 @@ static int _fetch_fn(const struct arg *args, struct sample *smp, const char *kw,
             return 0;
         }
     }
+    else
+    {
+        return 0;
+    }
 
     FP_LIB_FINGERPRINT_print(&fp, fp_buffer, 1024);
 
@@ -462,6 +479,13 @@ static int _ppfp_set_cap_pkt_max_size(char **args, int section_type, struct prox
     return _ppfp_write_u_int16_t_or_error(args, err, 0, 65536, &fplib_cfg.cap_config.cap_max_packet_size);
 }
 
+static int _ppfp_set_cap_max_locktime_ms(char **args, int section_type, struct proxy *curpx,
+                                         struct proxy *defpx, const char *file, int line,
+                                         char **err)
+{
+    return _ppfp_write_u_int32_t_or_error(args, err, 1, 65536, &fplib_cfg.cap_config.lock_wait_time_ms);
+}
+
 static int _ppfp_set_syn_map_bucket_size(char **args, int section_type, struct proxy *curpx,
                                          struct proxy *defpx, const char *file, int line,
                                          char **err)
@@ -524,6 +548,7 @@ static struct cfg_kw_list _ppfp_kws =
          {CFG_GLOBAL, "ppfp-tls-num-tickets", _ppfp_set_num_tickets},
          {CFG_GLOBAL, "ppfp-cap-ring-size", _ppfp_set_cap_ring_size},
          {CFG_GLOBAL, "ppfp-cap-pkt-max-size", _ppfp_set_cap_pkt_max_size},
+         {CFG_GLOBAL, "ppfp-cap-max-locktime-ms", _ppfp_set_cap_max_locktime_ms},
          {CFG_GLOBAL, "ppfp-syn-map-bucket-size", _ppfp_set_syn_map_bucket_size},
          {CFG_GLOBAL, "ppfp-syn-map-bucket-count", _ppfp_set_syn_map_bucket_count},
          {CFG_GLOBAL, "ppfp-tls-map-bucket-size", _ppfp_set_tls_map_bucket_size},
