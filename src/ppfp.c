@@ -483,7 +483,7 @@ static int _ppfp_set_cap_max_locktime_ms(char **args, int section_type, struct p
                                          struct proxy *defpx, const char *file, int line,
                                          char **err)
 {
-    return _ppfp_write_u_int32_t_or_error(args, err, 1, 65536, &fplib_cfg.cap_config.lock_wait_time_ms);
+    return _ppfp_write_u_int32_t_or_error(args, err, 0, 65536, &fplib_cfg.cap_config.lock_wait_time_ms);
 }
 
 static int _ppfp_set_syn_map_bucket_size(char **args, int section_type, struct proxy *curpx,
