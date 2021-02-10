@@ -507,14 +507,14 @@ static int _ppfp_set_tls_map_bucket_size(char **args, int section_type, struct p
                                          struct proxy *defpx, const char *file, int line,
                                          char **err)
 {
-    return _ppfp_write_int_or_error(args, err, 1, 65536, &fplib_cfg.tls_config.tls_map_bucket_size);
+    return _ppfp_write_int_or_error(args, err, 0, 65536, &fplib_cfg.tls_config.tls_map_bucket_size);
 }
 
 static int _ppfp_set_tls_map_bucket_count(char **args, int section_type, struct proxy *curpx,
                                           struct proxy *defpx, const char *file, int line,
                                           char **err)
 {
-    return _ppfp_write_int_or_error(args, err, 1, 65536, &fplib_cfg.tls_config.tls_map_bucket_count);
+    return _ppfp_write_int_or_error(args, err, 0, 65536, &fplib_cfg.tls_config.tls_map_bucket_count);
 }
 
 static int _ppfp_set_tls_session_timeout(char **args, int section_type, struct proxy *curpx,
