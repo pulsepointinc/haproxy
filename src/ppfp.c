@@ -367,11 +367,14 @@ static int init_ppfp(void)
         ha_alert("PPFP: FP_LIB_HANDLE_new failed with code %d: %s", errcode, errmsg);
         return ERR_ALERT | ERR_FATAL;
     }
-
-    if ((errcode = FP_LIB_HANDLE_start_capture(fph, errmsg)) != 0)
+    // don't run capture if ring size is 0
+    if (fplib_cfg.cap_config.cap_ring_buffer_size > 0)
     {
-        ha_alert("PPFP: FP_LIB_HANDLE_start_capture failed with code %d: %s\n", errcode, errmsg);
-        return ERR_ALERT | ERR_FATAL;
+        if ((errcode = FP_LIB_HANDLE_start_capture(fph, errmsg)) != 0)
+        {
+            ha_alert("PPFP: FP_LIB_HANDLE_start_capture failed with code %d: %s\n", errcode, errmsg);
+            return ERR_ALERT | ERR_FATAL;
+        }
     }
 
     if ((errcode = FP_LIB_HANDLE_instr_all_SSL_CTX(fph, errmsg)) != 0)
@@ -469,7 +472,7 @@ static int _ppfp_set_cap_ring_size(char **args, int section_type, struct proxy *
                                    struct proxy *defpx, const char *file, int line,
                                    char **err)
 {
-    return _ppfp_write_u_int16_t_or_error(args, err, 8, 65536, &fplib_cfg.cap_config.cap_ring_buffer_size);
+    return _ppfp_write_u_int16_t_or_error(args, err, 0, 65536, &fplib_cfg.cap_config.cap_ring_buffer_size);
 }
 
 static int _ppfp_set_cap_pkt_max_size(char **args, int section_type, struct proxy *curpx,
