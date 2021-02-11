@@ -271,10 +271,10 @@ static int _fetch_fn(const struct arg *args, struct sample *smp, const char *kw,
 {
     struct connection *cli_conn = objt_conn(smp->sess->origin);
     int port;
+    int fp_str_size;
     char src_ip_str[INET_ADDRSTRLEN];
     struct buffer *temp;
     FP_LIB_FINGERPRINT fp;
-    char fp_buffer[1024];
     if (!cli_conn)
         return 0;
     port = get_host_port(&cli_conn->addr.from);
@@ -293,9 +293,6 @@ static int _fetch_fn(const struct arg *args, struct sample *smp, const char *kw,
         return 0;
     }
 
-    temp = get_trash_chunk();
-    chunk_reset(temp);
-
     FP_LIB_FINGERPRINT_init(&fp);
     if (fph != NULL)
     {
@@ -309,17 +306,16 @@ static int _fetch_fn(const struct arg *args, struct sample *smp, const char *kw,
         return 0;
     }
 
-    FP_LIB_FINGERPRINT_print(&fp, fp_buffer, 1024);
-
-    // write fingerpting to temp buffer
-    chunk_appendf(temp, "%s", fp_buffer);
-    // reset type to str
+    temp = get_trash_chunk();
+    fp_str_size = FP_LIB_FINGERPRINT_print(&fp, temp->area, temp->size - temp->data);
+    if (fp_str_size < 0)
+    {
+        return 0;
+    }
+    temp->data = fp_str_size;
+    smp->data.u.str = *temp;
     smp->data.type = SMP_T_STR;
-    // update buffers
-    smp->data.u.str.area = temp->area;
-    smp->data.u.str.data = temp->data;
-    // flag the sample to show it uses constant memory
-    smp->flags |= SMP_F_CONST;
+    smp->flags |= SMP_F_CONST | SMP_F_VOL_SESS; // unclear what this does
     return 1;
 }
 
@@ -377,10 +373,14 @@ static int init_ppfp(void)
         }
     }
 
-    if ((errcode = FP_LIB_HANDLE_instr_all_SSL_CTX(fph, errmsg)) != 0)
+    // don't instrument SSL ctx if num tickets is 0
+    if (fplib_cfg.tls_config.tls_num_tickets > 0)
     {
-        ha_alert("PPFP: FP_LIB_HANDLE_instr_all_SSL_CTX failed with code %d: %s", errcode, errmsg);
-        return ERR_ALERT | ERR_FATAL;
+        if ((errcode = FP_LIB_HANDLE_instr_all_SSL_CTX(fph, errmsg)) != 0)
+        {
+            ha_alert("PPFP: FP_LIB_HANDLE_instr_all_SSL_CTX failed with code %d: %s", errcode, errmsg);
+            return ERR_ALERT | ERR_FATAL;
+        }
     }
 
     return 0;
@@ -465,7 +465,7 @@ static int _ppfp_set_num_tickets(char **args, int section_type, struct proxy *cu
                                  struct proxy *defpx, const char *file, int line,
                                  char **err)
 {
-    return _ppfp_write_int_or_error(args, err, 3, 65536, &fplib_cfg.tls_config.tls_num_tickets);
+    return _ppfp_write_int_or_error(args, err, 0, 65536, &fplib_cfg.tls_config.tls_num_tickets);
 }
 
 static int _ppfp_set_cap_ring_size(char **args, int section_type, struct proxy *curpx,
@@ -532,7 +532,7 @@ static int _ppfp_set_tls_session_timeout(char **args, int section_type, struct p
 static struct sample_fetch_kw_list fetch_keywords =
     {ILH,
      {
-         {"fpdata", _fetch_fn, ARG1(1, STR), _fetch_check_fn, SMP_T_STR, /*SMP_USE_HRQHV*/ SMP_USE_L4CLI},
+         {"fpdata", _fetch_fn, ARG1(1, STR), _fetch_check_fn, SMP_T_STR, SMP_USE_L5CLI},
          {NULL, NULL, 0, 0, 0},
      }};
 
