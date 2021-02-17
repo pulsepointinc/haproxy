@@ -25,7 +25,7 @@ RUN set -x \
 	&& tar -xzf /tmp/haproxy.tar.gz -C /usr/src/haproxy --strip-components=1 \
 	&& rm /tmp/haproxy.tar.gz \
 	\
-	&& eval "make -C /usr/src/haproxy/ppfp clean package CC=gcc" \
+	&& eval "make -C /usr/src/haproxy/ppfp clean test package CC=gcc" \
 	&& eval "cp /usr/src/haproxy/ppfp/src/fplib/fplib.h /usr/include" \
 	&& eval "cp /usr/src/haproxy/ppfp/target/libfingerprint.so /usr/lib/x86_64-linux-gnu" \
 	\
