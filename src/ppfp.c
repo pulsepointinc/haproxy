@@ -20,6 +20,7 @@
  *   ppfp-cap-ring-size              2048
  *   ppfp-cap-pkt-max-size           2048
  *   ppfp-cap-max-locktime-ms        500
+ *   ppfp-cap-max-errors             1
  *   ppfp-syn-map-bucket-size        32
  *   ppfp-syn-map-bucket-count       1024
  *   ppfp-tls-map-bucket-size        32
@@ -212,11 +213,7 @@ static int _configure_capstring()
         return -2;
     }
 
-    if (fplib_cfg.cap_config.cap_bpf_filter)
-    {
-        free(fplib_cfg.cap_config.cap_bpf_filter);
-    }
-    fplib_cfg.cap_config.cap_bpf_filter = strdup(cap_bpf_filter);
+    strncpy(fplib_cfg.cap_config.cap_bpf_filter, cap_bpf_filter, FP_LIB_BPF_FILTER_MAX_LEN);
     return 0;
 }
 
@@ -425,11 +422,7 @@ static int _ppfp_set_interface(char **args, int section_type, struct proxy *curp
         memprintf(err, "'%s' expects an interface name.", args[0]);
         return -1;
     }
-    if (fplib_cfg.cap_config.cap_device_name)
-    {
-        free(fplib_cfg.cap_config.cap_device_name);
-    }
-    fplib_cfg.cap_config.cap_device_name = strdup(args[1]);
+    strncpy(fplib_cfg.cap_config.cap_device_name, args[1], FP_LIB_IF_NAME_MAX_LEN - 1);
     return 0;
 }
 
@@ -503,6 +496,13 @@ static int _ppfp_set_syn_map_bucket_count(char **args, int section_type, struct 
     return _ppfp_write_int_or_error(args, err, 1, 65536, &fplib_cfg.cap_config.syn_map_bucket_count);
 }
 
+static int _ppfp_set_cap_max_errors(char **args, int section_type, struct proxy *curpx,
+                                          struct proxy *defpx, const char *file, int line,
+                                          char **err)
+{
+    return _ppfp_write_u_int16_t_or_error(args, err, 0, 65535, &fplib_cfg.cap_config.max_errors);
+}
+
 static int _ppfp_set_tls_map_bucket_size(char **args, int section_type, struct proxy *curpx,
                                          struct proxy *defpx, const char *file, int line,
                                          char **err)
@@ -552,6 +552,7 @@ static struct cfg_kw_list _ppfp_kws =
          {CFG_GLOBAL, "ppfp-cap-ring-size", _ppfp_set_cap_ring_size},
          {CFG_GLOBAL, "ppfp-cap-pkt-max-size", _ppfp_set_cap_pkt_max_size},
          {CFG_GLOBAL, "ppfp-cap-max-locktime-ms", _ppfp_set_cap_max_locktime_ms},
+         {CFG_GLOBAL, "ppfp-cap-max-errors", _ppfp_set_cap_max_errors},
          {CFG_GLOBAL, "ppfp-syn-map-bucket-size", _ppfp_set_syn_map_bucket_size},
          {CFG_GLOBAL, "ppfp-syn-map-bucket-count", _ppfp_set_syn_map_bucket_count},
          {CFG_GLOBAL, "ppfp-tls-map-bucket-size", _ppfp_set_tls_map_bucket_size},
