@@ -570,7 +570,7 @@ static struct cfg_kw_list _ppfp_kws =
          {CFG_GLOBAL, "ppfp-cap-max-locktime-ms", _ppfp_set_cap_max_locktime_ms},
          {CFG_GLOBAL, "ppfp-cap-max-errors", _ppfp_set_cap_max_errors},
          {CFG_GLOBAL, "ppfp-cap-max-packets", _ppfp_set_cap_max_packets},
-         {CFG_GLOBAL, "ppfp-cap-max-empty-iterations", _ppfp_set_cap_max_empty_iterations}
+         {CFG_GLOBAL, "ppfp-cap-max-empty-iterations", _ppfp_set_cap_max_empty_iterations},
          {CFG_GLOBAL, "ppfp-syn-map-bucket-size", _ppfp_set_syn_map_bucket_size},
          {CFG_GLOBAL, "ppfp-syn-map-bucket-count", _ppfp_set_syn_map_bucket_count},
          {CFG_GLOBAL, "ppfp-tls-map-bucket-size", _ppfp_set_tls_map_bucket_size},
