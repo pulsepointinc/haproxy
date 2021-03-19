@@ -92,46 +92,62 @@ int from_hex(unsigned char *dest, char *src, int max_dest_bytes)
     return written;
 }
 
-static int _ppfp_write_int_or_error(char **args, char **err, int min_value, int max_value, int *dest)
+static int _ppfp_check_int_range(char **args, char **err, long min_value, long max_value)
 {
-    int int_value = 0;
+    long long_value = 0;
     if (*(args[1]) == 0)
     {
-        memprintf(err, "'%s' expects an int greater than %d and less than %d.", args[0], min_value, max_value);
+        memprintf(err, "'%s' expects an int greater than %ld and less than %ld.", args[0], min_value, max_value);
         return -1;
     }
-    int_value = atoi(args[1]);
-    if (int_value < min_value || int_value > max_value)
+    long_value = atol(args[1]);
+    if (long_value < min_value || long_value > max_value)
     {
-        memprintf(err, "'%s' expects an int greater than %d and less than %d.", args[0], min_value, max_value);
+        memprintf(err, "'%s' expects an int greater than %ld and less than %ld.", args[0], min_value, max_value);
         return -1;
     }
-    *dest = int_value;
     return 0;
 }
 
-static int _ppfp_write_u_int16_t_or_error(char **args, char **err, int min_value, int max_value, u_int16_t *dest)
+static int _ppfp_write_int_or_error(char **args, char **err, int min_value, int max_value, int *dest)
 {
-    int int_value = 0;
-    int retval = _ppfp_write_int_or_error(args, err, min_value, max_value, &int_value);
-    if (retval < 0)
+    int check_result = _ppfp_check_int_range(args, err, min_value, max_value);
+    if (check_result != 0)
     {
-        return retval;
+        return check_result;
     }
-    *dest = int_value;
-    return retval;
+    *dest = atoi(args[1]);
+    return 0;
 }
 
-static int _ppfp_write_u_int32_t_or_error(char **args, char **err, int min_value, int max_value, u_int32_t *dest)
+static int _ppfp_write_u_int16_t_or_error(char **args, char **err, u_int16_t min_value, u_int16_t max_value, u_int16_t *dest)
 {
-    int int_value = 0;
-    int retval = _ppfp_write_int_or_error(args, err, min_value, max_value, &int_value);
-    if (retval < 0)
+    int value = 0;
+    u_int16_t u16value = 0;
+    int check_result = _ppfp_check_int_range(args, err, min_value, max_value);
+    if (check_result != 0)
     {
-        return retval;
+        return check_result;
     }
-    *dest = int_value;
-    return retval;
+    value = atoi(args[1]);
+    u16value = (u_int16_t)value;
+    *dest = u16value;
+    return 0;
+}
+
+static int _ppfp_write_u_int32_t_or_error(char **args, char **err, u_int32_t min_value, u_int32_t max_value, u_int32_t *dest)
+{
+    long value = 0;
+    u_int32_t u32value = 0;
+    int check_result = _ppfp_check_int_range(args, err, min_value, max_value);
+    if (check_result != 0)
+    {
+        return check_result;
+    }
+    value = atol(args[1]);
+    u32value = (u_int32_t)value;
+    *dest = u32value;
+    return 0;
 }
 
 static int _ppfp_write_binhex_or_error(char **args, char **err, int min_bytes, int max_bytes, unsigned char *dest, int *opt_size)
@@ -432,7 +448,7 @@ static int _ppfp_set_tls_port(char **args, int section_type, struct proxy *curpx
                               struct proxy *defpx, const char *file, int line,
                               char **err)
 {
-    return _ppfp_write_int_or_error(args, err, 0, 65536, &tls_listen_port);
+    return _ppfp_write_int_or_error(args, err, 0, 65535, &tls_listen_port);
 }
 
 static int _ppfp_set_aes_key(char **args, int section_type, struct proxy *curpx,
@@ -460,61 +476,61 @@ static int _ppfp_set_num_tickets(char **args, int section_type, struct proxy *cu
                                  struct proxy *defpx, const char *file, int line,
                                  char **err)
 {
-    return _ppfp_write_int_or_error(args, err, 0, 65536, &fplib_cfg.tls_config.tls_num_tickets);
+    return _ppfp_write_int_or_error(args, err, 0, 65535, &fplib_cfg.tls_config.tls_num_tickets);
 }
 
 static int _ppfp_set_cap_ring_size(char **args, int section_type, struct proxy *curpx,
                                    struct proxy *defpx, const char *file, int line,
                                    char **err)
 {
-    return _ppfp_write_u_int16_t_or_error(args, err, 0, 65536, &fplib_cfg.cap_config.cap_ring_buffer_size);
+    return _ppfp_write_u_int16_t_or_error(args, err, 0, 65535, &fplib_cfg.cap_config.cap_ring_buffer_size);
 }
 
 static int _ppfp_set_cap_pkt_max_size(char **args, int section_type, struct proxy *curpx,
                                       struct proxy *defpx, const char *file, int line,
                                       char **err)
 {
-    return _ppfp_write_u_int16_t_or_error(args, err, 0, 65536, &fplib_cfg.cap_config.cap_max_packet_size);
+    return _ppfp_write_u_int16_t_or_error(args, err, 0, 65535, &fplib_cfg.cap_config.cap_max_packet_size);
 }
 
 static int _ppfp_set_cap_max_locktime_ms(char **args, int section_type, struct proxy *curpx,
                                          struct proxy *defpx, const char *file, int line,
                                          char **err)
 {
-    return _ppfp_write_u_int32_t_or_error(args, err, 0, 65536, &fplib_cfg.cap_config.lock_wait_time_ms);
+    return _ppfp_write_u_int32_t_or_error(args, err, 0, 65535, &fplib_cfg.cap_config.lock_wait_time_ms);
 }
 
 static int _ppfp_set_syn_map_bucket_size(char **args, int section_type, struct proxy *curpx,
                                          struct proxy *defpx, const char *file, int line,
                                          char **err)
 {
-    return _ppfp_write_int_or_error(args, err, 1, 65536, &fplib_cfg.cap_config.syn_map_bucket_size);
+    return _ppfp_write_int_or_error(args, err, 1, 65535, &fplib_cfg.cap_config.syn_map_bucket_size);
 }
 
 static int _ppfp_set_syn_map_bucket_count(char **args, int section_type, struct proxy *curpx,
                                           struct proxy *defpx, const char *file, int line,
                                           char **err)
 {
-    return _ppfp_write_int_or_error(args, err, 1, 65536, &fplib_cfg.cap_config.syn_map_bucket_count);
+    return _ppfp_write_int_or_error(args, err, 1, 65535, &fplib_cfg.cap_config.syn_map_bucket_count);
 }
 
 static int _ppfp_set_cap_max_errors(char **args, int section_type, struct proxy *curpx,
-                                          struct proxy *defpx, const char *file, int line,
-                                          char **err)
+                                    struct proxy *defpx, const char *file, int line,
+                                    char **err)
 {
     return _ppfp_write_u_int16_t_or_error(args, err, 0, 65535, &fplib_cfg.cap_config.max_errors);
 }
 
 static int _ppfp_set_cap_max_packets(char **args, int section_type, struct proxy *curpx,
-                                          struct proxy *defpx, const char *file, int line,
-                                          char **err)
+                                     struct proxy *defpx, const char *file, int line,
+                                     char **err)
 {
     return _ppfp_write_u_int32_t_or_error(args, err, 0, 4294967295, &fplib_cfg.cap_config.max_packets_per_capture);
 }
 
 static int _ppfp_set_cap_max_empty_iterations(char **args, int section_type, struct proxy *curpx,
-                                          struct proxy *defpx, const char *file, int line,
-                                          char **err)
+                                              struct proxy *defpx, const char *file, int line,
+                                              char **err)
 {
     return _ppfp_write_u_int32_t_or_error(args, err, 0, 4294967295, &fplib_cfg.cap_config.max_empty_iteration_count);
 }
@@ -523,21 +539,21 @@ static int _ppfp_set_tls_map_bucket_size(char **args, int section_type, struct p
                                          struct proxy *defpx, const char *file, int line,
                                          char **err)
 {
-    return _ppfp_write_int_or_error(args, err, 0, 65536, &fplib_cfg.tls_config.tls_map_bucket_size);
+    return _ppfp_write_int_or_error(args, err, 0, 65535, &fplib_cfg.tls_config.tls_map_bucket_size);
 }
 
 static int _ppfp_set_tls_map_bucket_count(char **args, int section_type, struct proxy *curpx,
                                           struct proxy *defpx, const char *file, int line,
                                           char **err)
 {
-    return _ppfp_write_int_or_error(args, err, 0, 65536, &fplib_cfg.tls_config.tls_map_bucket_count);
+    return _ppfp_write_int_or_error(args, err, 0, 65535, &fplib_cfg.tls_config.tls_map_bucket_count);
 }
 
 static int _ppfp_set_tls_session_timeout(char **args, int section_type, struct proxy *curpx,
                                          struct proxy *defpx, const char *file, int line,
                                          char **err)
 {
-    return _ppfp_write_int_or_error(args, err, 1, 2147483647, &fplib_cfg.tls_config.tls_session_timeout_sec);
+    return _ppfp_write_u_int32_t_or_error(args, err, 1, 2147483647, &fplib_cfg.tls_config.tls_session_timeout_sec);
 }
 
 /* registration */
