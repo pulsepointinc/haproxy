@@ -218,8 +218,8 @@ static int _configure_capstring()
     int errcode = 0;
     char cap_bpf_filter[1024];
     char cap_dst_ipv4[16];
-    bzero(cap_dst_ipv4, 1024);
-    bzero(cap_bpf_filter, 16);
+    bzero(cap_bpf_filter, 1024);
+    bzero(cap_dst_ipv4, 16);
 
     if ((errcode = _get_ipv4_addr(cap_dst_ipv4, fplib_cfg.cap_config.cap_device_name)) != 0)
     {
