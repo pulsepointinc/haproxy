@@ -3037,14 +3037,14 @@ int main(int argc, char **argv)
 				ha_warning("[%s.main()] Failed to drop supplementary groups. Using 'gid'/'group'"
 					   " without 'uid'/'user' is generally useless.\n", argv[0]);
 
-			if (setgid(global.gid) == -1) {
+			if (setegid(global.gid) == -1) {
 				ha_alert("[%s.main()] Cannot set gid %d.\n", argv[0], global.gid);
 				protocol_unbind_all();
 				exit(1);
 			}
 		}
 
-		if (global.uid && setuid(global.uid) == -1) {
+		if (global.uid && seteuid(global.uid) == -1) {
 			ha_alert("[%s.main()] Cannot set uid %d.\n", argv[0], global.uid);
 			protocol_unbind_all();
 			exit(1);
@@ -3272,14 +3272,14 @@ int main(int argc, char **argv)
 				ha_warning("[%s.main()] Failed to drop supplementary groups. Using 'gid'/'group'"
 					   " without 'uid'/'user' is generally useless.\n", argv[0]);
 
-			if (setgid(global.gid) == -1) {
+			if (setegid(global.gid) == -1) {
 				ha_alert("[%s.main()] Cannot set gid %d.\n", argv[0], global.gid);
 				protocol_unbind_all();
 				exit(1);
 			}
 		}
 
-		if (global.uid && setuid(global.uid) == -1) {
+		if (global.uid && seteuid(global.uid) == -1) {
 			ha_alert("[%s.main()] Cannot set uid %d.\n", argv[0], global.uid);
 			protocol_unbind_all();
 			exit(1);
