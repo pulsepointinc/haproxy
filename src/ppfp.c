@@ -28,11 +28,13 @@
  *   ppfp-tls-map-bucket-size        32
  *   ppfp-tls-map-bucket-count       1024
  *   ppfp-tls-session-timeout-sec    14515200
+ *   ppfp-debug                      false
  * ...
  * backend test-proxy-srv
  *   mode            http
  *   ...
  *   http-request add-header X-PPFP-FingerPrint %[fpdata()]
+ *   http-request add-header X-PPFP-Debug %[fpdebugdata()]
  *   ...
  */
 
@@ -90,6 +92,24 @@ int from_hex(unsigned char *dest, char *src, int max_dest_bytes)
         dest[written++] = one_byte;
     }
     return written;
+}
+
+static int _ppfp_write_bool_true_as_1(char **args, char **err, int *dest)
+{
+    if (*(args[1]) == 0)
+    {
+        memprintf(err, "'%s' expects true/false", args[0]);
+        return -1;
+    }
+    if (strcmp("true", args[1]) == 0)
+    {
+        *dest = 1;
+    }
+    else
+    {
+        *dest = 0;
+    }
+    return 0;
 }
 
 static int _ppfp_check_int_range(char **args, char **err, long min_value, long max_value)
@@ -290,6 +310,11 @@ static int _fetch_fn(const struct arg *args, struct sample *smp, const char *kw,
     char src_ip_str[INET_ADDRSTRLEN];
     struct buffer *temp;
     FP_LIB_FINGERPRINT fp;
+
+    if (ppfp_enabled == 0)
+    {
+        return 0;
+    }
     if (!cli_conn)
         return 0;
     port = get_host_port(&cli_conn->addr.from);
@@ -323,6 +348,67 @@ static int _fetch_fn(const struct arg *args, struct sample *smp, const char *kw,
 
     temp = get_trash_chunk();
     fp_str_size = FP_LIB_FINGERPRINT_print(&fp, temp->area, temp->size - temp->data);
+    if (fp_str_size < 0)
+    {
+        return 0;
+    }
+    temp->data = fp_str_size;
+    smp->data.u.str = *temp;
+    smp->data.type = SMP_T_STR;
+    smp->flags |= SMP_F_CONST | SMP_F_VOL_SESS; // unclear what this does
+    return 1;
+}
+
+/**
+ * @brief fetch function for "fpdebugdata" variables; 
+ */
+static int _fetch_debug_fn(const struct arg *args, struct sample *smp, const char *kw, void *private)
+{
+    struct connection *cli_conn = objt_conn(smp->sess->origin);
+    int port;
+    int fp_str_size;
+    char src_ip_str[INET_ADDRSTRLEN];
+    struct buffer *temp;
+    FP_LIB_DEBUG_DATA dd;
+
+    if (ppfp_enabled == 0 || fplib_cfg.debug != 1)
+    {
+        return 0;
+    }
+
+    if (!cli_conn)
+        return 0;
+    port = get_host_port(&cli_conn->addr.from);
+    switch (cli_conn->addr.from.ss_family)
+    {
+    case AF_INET:
+        if (inet_ntop(AF_INET, &((struct sockaddr_in *)&cli_conn->addr.from)->sin_addr, src_ip_str, INET_ADDRSTRLEN) == NULL)
+        {
+            return 0;
+        }
+        break;
+    case AF_INET6:
+        // ((struct sockaddr_in6 *)&cli_conn->addr.from)->sin6_addr;
+        return 0;
+    default:
+        return 0;
+    }
+
+    FP_LIB_DEBUG_DATA_init(&dd);
+    if (fph != NULL)
+    {
+        if (FP_LIB_HANDLE_get_DEBUG_DATA(fph, src_ip_str, port, &dd, NULL) != 0)
+        {
+            return 0;
+        }
+    }
+    else
+    {
+        return 0;
+    }
+
+    temp = get_trash_chunk();
+    fp_str_size = FP_LIB_DEBUG_DATA_print(&dd, temp->area, temp->size - temp->data);
     if (fp_str_size < 0)
     {
         return 0;
@@ -415,20 +501,14 @@ static int _ppfp_set_enabled(char **args, int section_type, struct proxy *curpx,
                              struct proxy *defpx, const char *file, int line,
                              char **err)
 {
-    if (*(args[1]) == 0)
-    {
-        memprintf(err, "'%s' expects true/false", args[0]);
-        return -1;
-    }
-    if (strcmp("true", args[1]) == 0)
-    {
-        ppfp_enabled = 1;
-    }
-    else
-    {
-        ppfp_enabled = 0;
-    }
-    return 0;
+    return _ppfp_write_bool_true_as_1(args, err, &ppfp_enabled);
+}
+
+static int _ppfp_set_debug(char **args, int section_type, struct proxy *curpx,
+                           struct proxy *defpx, const char *file, int line,
+                           char **err)
+{
+    return _ppfp_write_bool_true_as_1(args, err, &fplib_cfg.debug);
 }
 
 static int _ppfp_set_interface(char **args, int section_type, struct proxy *curpx,
@@ -565,6 +645,7 @@ static struct sample_fetch_kw_list fetch_keywords =
     {ILH,
      {
          {"fpdata", _fetch_fn, ARG1(1, STR), _fetch_check_fn, SMP_T_STR, SMP_USE_L5CLI},
+         {"fpdebugdata", _fetch_debug_fn, ARG1(1, STR), _fetch_check_fn, SMP_T_STR, SMP_USE_L5CLI},
          {NULL, NULL, 0, 0, 0},
      }};
 
@@ -592,6 +673,7 @@ static struct cfg_kw_list _ppfp_kws =
          {CFG_GLOBAL, "ppfp-tls-map-bucket-size", _ppfp_set_tls_map_bucket_size},
          {CFG_GLOBAL, "ppfp-tls-map-bucket-count", _ppfp_set_tls_map_bucket_count},
          {CFG_GLOBAL, "ppfp-tls-session-timeout-sec", _ppfp_set_tls_session_timeout},
+         {CFG_GLOBAL, "ppfp-debug", _ppfp_set_debug},
          {0, NULL, NULL},
      }};
 
