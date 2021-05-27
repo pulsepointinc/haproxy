@@ -645,7 +645,7 @@ static struct sample_fetch_kw_list fetch_keywords =
     {ILH,
      {
          {"fpdata", _fetch_fn, ARG1(1, STR), _fetch_check_fn, SMP_T_STR, SMP_USE_L5CLI},
-         {"fpdebugdata", _fetch_debug_fn, ARG1(1, STR), _fetch_check_fn, SMP_T_STR, SMP_USE_L5CLI},
+         {"fpdebugdata", _fetch_debug_fn, ARG1(1, STR), _fetch_check_fn, SMP_T_STR, SMP_SRC_HRQBO},
          {NULL, NULL, 0, 0, 0},
      }};
 
